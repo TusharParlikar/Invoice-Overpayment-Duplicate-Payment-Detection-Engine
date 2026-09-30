@@ -1,247 +1,196 @@
 # Invoice Overpayment & Duplicate Payment Detection Engine
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Precision](https://img.shields.io/badge/Precision-98.6%25-brightgreen.svg)]()
-[![Recall](https://img.shields.io/badge/Recall-96.5%25-green.svg)]()
-[![F1-Score](https://img.shields.io/badge/F1--Score-0.975-blue.svg)]()
-[![False--Duplicate--Reduction](https://img.shields.io/badge/False--Duplicate--Reduction-59.6%25-orange.svg)]()
-[![Records](https://img.shields.io/badge/Scale-100%2C000%2B%20Records-purple.svg)]()
+[![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg)](https://streamlit.io/)
 
-> **Production-grade anomaly detection pipeline** combining **Isolation Forest machine learning**, **rule-based heuristics**, and **high-performance fuzzy matching (Levenshtein + Jaro-Winkler)** to identify duplicate and overpaid invoices across multi-ERP environments (SAP, Oracle, NetSuite).
+**Check an invoice or receipt before you pay it.** Upload a photo, a scan, a PDF or an Excel batch. The engine
+compares each one with your company's own payment history and tells you, in plain language, whether it looks like
+something you've already paid, an amount far above what that vendor normally charges, or an image that may have been
+edited.
 
----
-
-## Key Highlights & Benchmarks
-
-- **104,983 Invoices Audited**: Processed end-to-end in **about 15 seconds**.
-- **98.6% Precision** (exceeds 91% requirement): High confidence detection with minimal false alarms (79 false positives out of 99,225 clean records).
-- **96.5% Recall**: Detected **5,556 out of 5,758** injected anomalies across all fraud categories.
-- **59.6% Reduction in False-Duplicate Flags**: Applied Levenshtein and Jaro-Winkler string similarity to reconcile vendor name variations and cross-ERP invoice ID formats, eliminating 2,470 false candidate matches.
-- **Full Data Persistence**: SQLite relational database with WAL mode, indexing, and complete audit trail.
-
----
-
-## System Architecture
-
-```
-                                  INVOICE DATA PIPELINE
-                                  
-   +-----------------------+     +------------------------+     +-----------------------+
-   |   Synthetic Data      | --> |     SQLite Database    | --> |     Preprocessing     |
-   | (100K+ ERP Records)   |     |    (WAL Mode + Index)  |     |   (Cleaning & USD)    |
-   +-----------------------+     +------------------------+     +-----------------------+
-                                                                            |
-                                                                            v
-   +-----------------------+     +------------------------+     +-----------------------+
-   |  Ensemble Aggregator  | <-- |   Isolation Forest ML  | <-- |     Fuzzy Matcher     |
-   |  (60% Rules + 40% ML) |     |  (Unsupervised Models) |     | (Levenshtein + J-W)   |
-   +-----------------------+     +------------------------+     +-----------------------+
-              |                                                             |
-              v                                                             v
-   +-----------------------+                                    +-----------------------+
-   |  Evaluation & Metrics |                                    |  Feature Engineering  |
-   | (Precision / Recall)  |                                    | (Z-scores, Frequency) |
-   +-----------------------+                                    +-----------------------+
-```
-
----
-
-## Detection Modules
-
-### 1. Fuzzy Matching Engine (`matching/fuzzy_matcher.py`)
-- **Challenge**: Across disparate ERP systems (SAP, Oracle, NetSuite), identical vendors appear as *"Acme Corp"*, *"ACME CORPORATION"*, *"Acme Corp Inc"*, or *"acme corporation llc"*, and invoice IDs differ by dashes (`SAP-2024-123456` vs `SAP2024123456` vs `SAP-2024-123456-A`).
-- **Solution**:
-  - **Blocking Strategy**: Groups by 3-character prefix keys to reduce comparison complexity from $\mathcal{O}(N^2)$ to sparse candidate windows.
-  - **Dual Metric Similarity**: Combines Levenshtein ratio ($40\%$) and Jaro-Winkler similarity ($60\%$) via `rapidfuzz`.
-  - **Cross-ERP ID Normalization**: Strips delimiters and applies sequence alignment.
-  - **False Duplicate Pruning**: Evaluated 4,141 candidate pairs, confirmed 1,671 true cross-ERP duplicates, and pruned 2,470 false matches (**59.6% reduction in false-duplicate flags**).
-
-### 2. Rule-Based Engine (`detection/rule_engine.py`)
-Five specialized domain rules:
-- **Rule 1 — Exact Duplicate**: Identifies duplicate submissions with matching `(vendor_id, invoice_id, amount)`. Preserves first legitimate entry and flags subsequent copies.
-- **Rule 2 — Cross-ERP Near Duplicate**: Surfaces pairs confirmed by fuzzy matching with similar amounts ($\pm 0.5\%$) and dates within 7 days.
-- **Rule 3 — Overpayment Anomaly**: Flags transactions exceeding $3.0\times$ vendor historical median with Z-score $\ge 3.5$.
-- **Rule 4 — Rapid-Fire Burst**: Flags burst submissions ($\ge 3$ invoices for the same vendor & PO on the same date).
-- **Rule 5 — Suspicious Round Number**: Flags large round-number payments ($\ge \$25,000$, multiple of $\$5,000$) departing from vendor baseline.
-
-### 3. Machine Learning Detector (`detection/ml_detector.py`)
-- **Algorithm**: `IsolationForest` (scikit-learn) with 200 estimators and 6.5% contamination factor.
-- **Feature Space**:
-  - `amount_usd`: Currency-standardized invoice amount
-  - `amount_zscore`: Per-vendor statistical standard deviation score
-  - `amount_to_vendor_median`: Ratio against historical vendor median
-  - `amount_to_vendor_max`: Ratio against historical vendor maximum
-  - `vendor_invoice_count_30d`: Monthly cadence frequency
-  - `days_since_last_invoice`: Inter-arrival submission time
-  - `same_amount_count_30d`: Repetitive amount volume
-  - `max_fuzzy_score`: Maximum fuzzy similarity score from candidate pairs
-
-### 4. Ensemble Classifier (`detection/ensemble.py`)
-- Blends rule scores ($60\%$) and unsupervised ML scores ($40\%$).
-- High-confidence rule triggers (exact dup, near dup, statistical overpayment) receive confidence boosting ($\ge 0.88$).
-- Structured categorical risk ratings:
-  - **HIGH RISK** ($\ge 0.70$): Immediate audit / payment hold
-  - **MEDIUM RISK** ($0.40 - 0.70$): Secondary review
-  - **LOW RISK** ($< 0.40$): Standard automated approval
-
----
-
-## Evaluation & Benchmark Results
-
-Run on **104,983 invoices** with **5,758 injected ground-truth anomalies**:
-
-```text
-============================================================
-  EVALUATION REPORT (Score Threshold: 0.50)
-============================================================
-
---- Overall Detection Performance ---
-  Precision: 0.9860  (98.6%)
-  Recall:    0.9649  (96.5%)
-  F1 Score:  0.9753
-
---- Breakdown by Anomaly Type ---
-  Anomaly Category   | Precision  | Recall     | F1         | Count
-  ----------------------------------------------------------
-  exact_duplicate    | 0.952      | 1.000      | 0.976      | 1,575
-  near_duplicate     | 0.952      | 0.999      | 0.975      | 1,575
-  overpayment        | 0.946      | 0.873      | 0.908      | 1,575
-  rapid_fire         | 0.929      | 1.000      | 0.963      | 1,033
-
---- Confusion Matrix ---
-  True Negatives (TN) : 99,146 | False Positives (FP):     79
-  False Negatives (FN):    202 | True Positives (TP) :  5,556
-
---- Summary ---
-  Total Invoices Audited : 104,983
-  Invoices Flagged Risk  : 5,635 (5.37% flag rate)
-  True Anomalies Caught  : 5,556 of 5,758 (96.5%)
-============================================================
-
-============================================================
-  FUZZY MATCHING IMPACT VS NAIVE BASELINE
-============================================================
-  Candidate pairs evaluated (amount & date proximity) : 4,141
-  Pairs confirmed by fuzzy matching (Levenshtein + JW) : 1,671
-  False-duplicate matches eliminated                   : 2,470
-  False-Duplicate Flag Reduction                       : 59.6%
-============================================================
-```
-
-### Execution Speed
-| Pipeline Stage | Records Processed | Runtime |
+| Verdict | Meaning | What to do |
 |---|---|---|
-| Synthetic Data Generation & DB Insert | 104,983 invoices, 2,500 vendors | 6.84s |
-| Data Cleaning & Normalization | 104,983 invoices | 0.64s |
-| Fuzzy Matching (Levenshtein + JW) | 4,141 candidate pairs | 1.19s |
-| Vectorized Feature Engineering | 7 behavioral/statistical features | 0.45s |
-| Rule Engine (5 Rules) | 104,983 invoices | 0.51s |
-| ML Isolation Forest | 104,983 invoices | 3.77s |
-| Ensemble Scoring & Risk Categorization | 104,983 invoices | 0.24s |
-| Evaluation Metrics & Baseline Comparison | 104,983 invoices | 0.74s |
-| SQLite Result Persistence | 104,983 detection results, 1,671 pairs | 0.69s |
-| **Total End-to-End Pipeline** | **104,983 Invoices** | **15.08s** |
+| **OK** | Nothing matches an existing record; the amount is normal for this vendor | Pay as usual |
+| **REVIEW** | Something is unusual but not conclusive (odd amount, image may be edited) | A person takes a second look |
+| **SUSPICIOUS** | Strong evidence: duplicates a paid invoice, or is a clear overpayment | Hold the payment and investigate |
+
+Every verdict comes with the reasons and the matching past records, so a reviewer can confirm it in seconds.
 
 ---
 
-## Installation & Usage
+## The problem
 
-### 1. Prerequisites
-Python 3.10+ installed.
+Paying the same invoice twice, or paying more than you owe, is a common and hard-to-see way accounts-payable (AP)
+teams lose money. It rarely looks like fraud; it looks like ordinary data.
 
-### 2. Install Dependencies
+| | |
+|---|---|
+| **Symptoms** | The same supplier invoice paid twice; payments far above a vendor's normal amount; reimbursements for edited receipts |
+| **Root causes** | One invoice entered in several systems or by several people; formats differ (`SAP-2024-123456` vs `SAP2024123456`, "Acme Corp" vs "ACME CORPORATION LLC", dates a few days apart); nobody compares every invoice with each vendor's history; receipt images are easy to edit |
+| **How it's handled today** | ERP duplicate checks that match exact fields; periodic manual sampling; after-the-fact recovery audits (see [COMPARISON](docs/COMPARISON.md)) |
+| **Why that falls short** | Exact matching misses reformatted duplicates by construction; manual review doesn't scale; recovery audits act after the money is gone |
+| **Consequences** | Direct cash loss, time spent chasing refunds from suppliers, audit findings |
+
+## The solution
+
+A local, explainable checker that matches the way a careful reviewer would: tolerant of formatting, aware of each
+vendor's normal behaviour, and able to say why.
+
+| Feature | Solves | Core / supporting |
+|---|---|---|
+| **Fuzzy duplicate matching** (reformatted numbers, name variants, dates within 7 days) | Duplicates that exact checks miss | Core |
+| **Exact duplicate, overpayment, burst and round-number rules** | Clear-cut cases with auditable reasons | Core |
+| **Anomaly model trained on your own history** (Isolation Forest) | Unusual payments no rule describes | Core |
+| **Receipt intake**: photo/scan (OCR), PDF, manual form, Excel/CSV batch | Getting invoices in without retyping | Core |
+| **Plain-language reasons + matching records** | Reviewers can act on a flag | Core |
+| **Image-tamper score** | Possibly edited receipt images (weak; only asks for review) | Supporting |
+| **Import from ERP exports** with loose column matching | Loading history without reformatting files | Supporting |
+| **Full audit** of all records | Finding duplicates already paid | Supporting |
+| **Check log** (`receipt_checks`) | Audit trail of every check | Supporting |
+
+## Who it's for
+
+| User | Use case | Value |
+|---|---|---|
+| AP clerk | Check invoices due this week (Excel batch) before the payment run | Duplicates and overpayments stopped before payment |
+| Expense reviewer | Check a receipt photo attached to a claim | Resubmitted or edited receipts flagged |
+| Finance controller / auditor | Run a full audit of historical payments | List of duplicates already paid, to recover |
+| Developer / analyst | Tune thresholds, add rules, retrain | Transparent code and measured models |
+
+**Use it** before releasing payments, for expense claims backed by receipt photos, in companies where invoices enter
+through several systems or people, and for periodic audits of past payments.
+
+**Don't use it** as proof of fraud (it prioritises what a human should check); without payment history (duplicate and
+overpayment checks compare against your records); for mixed currencies without adding exchange rates (only
+USD/EUR/GBP are converted); or as a public web app holding real invoices (there is no login yet).
+
+---
+
+## Quick start
+
 ```bash
 pip install -r requirements.txt
+
+# Load company history (CSV/Excel export). Columns are matched loosely: Invoice No, Supplier, Date, Total...
+python -m intake.importer invoices_2024.xlsx       # --dayfirst for dd/mm/yyyy dates
+
+#   ...or demo history from ~380 real scanned receipts (downloads a ~670 MB dataset once):
+python -m forgery.dataset --history demo_history.csv
+python -m intake.importer demo_history.csv
+
+python pipeline.py                  # audit all records + train the anomaly model on them
+python -m streamlit run app.py      # open http://localhost:8501
+python tests/test_core.py           # optional: confirm the install (3 "ok" lines)
 ```
 
-Required packages:
-- `pandas >= 2.0.0`
-- `numpy >= 1.24.0`
-- `scikit-learn >= 1.3.0`
-- `rapidfuzz >= 3.0.0`
-- `Faker >= 19.0.0`
+**In the app:** *Check receipt* (upload a photo/PDF or type the fields; correct anything OCR misread; **Check
+authenticity**; **Add to company records** once paid) · *Batch check* (Excel/CSV, downloadable results) ·
+*Import records* · *Records* (recent checks, highest-risk records) · sidebar **Audit records & train model**.
 
-### 3. Run the Full Pipeline
-```bash
-python pipeline.py
-```
-Each run rebuilds `data/invoices.db` from scratch. Output is fully reproducible: the same `RANDOM_SEED` gives identical data and results on every run.
-
-### 4. Query the Database
-The pipeline creates and populates `data/invoices.db` (SQLite):
-
-```python
-from database.db_manager import DatabaseManager
-
-with DatabaseManager() as db:
-    # Highest-risk flagged invoices
-    high_risk = db.execute_query("""
-        SELECT i.invoice_id, i.vendor_name, i.amount, d.final_score, d.risk_category, d.flags
-        FROM invoices i
-        JOIN detection_results d ON i.id = d.invoice_row_id
-        WHERE d.risk_category = 'HIGH'
-        ORDER BY d.final_score DESC
-        LIMIT 10
-    """)
-    print(high_risk)
-
-    # Cross-ERP duplicate pairs reconciled by the fuzzy matcher
-    fuzzy_pairs = db.execute_query("""
-        SELECT a.invoice_id AS original_inv, b.invoice_id AS duplicate_inv,
-               f.similarity_score, f.match_type
-        FROM fuzzy_match_pairs f
-        JOIN invoices a ON f.record_a_id = a.id
-        JOIN invoices b ON f.record_b_id = b.id
-        LIMIT 10
-    """)
-    print(fuzzy_pairs)
-```
-
-### 5. Tuning
-Settings live in `config.py`:
-- **Fuzzy match strictness**: `FUZZY_THRESHOLD` (default `0.85`).
-- **Rules vs. ML influence**: `ENSEMBLE_RULE_WEIGHT` / `ENSEMBLE_ML_WEIGHT` (default `0.6` / `0.4`).
-- **Risk bands**: `RISK_HIGH_THRESHOLD` / `RISK_MEDIUM_THRESHOLD` (default `0.7` / `0.4`).
-- **Isolation Forest**: `ISOLATION_FOREST_N_ESTIMATORS`, `ISOLATION_FOREST_CONTAMINATION`.
-- **Dataset**: `NUM_RECORDS`, the per-anomaly `*_RATE` values, and `RANDOM_SEED`.
+Required import columns: invoice number, vendor, date, amount. Recommended: vendor ID. Details, configuration and
+the Python API: [docs/REFERENCE.md](docs/REFERENCE.md).
 
 ---
 
-## Project Structure
+## How it works
 
+```mermaid
+flowchart LR
+    IN["photo · scan · PDF<br/>manual · Excel"] --> OCR["OCR + field parser<br/>(review form)"]
+    OCR --> NEW["new invoice(s)"]
+    NEW --> H["+ relevant history<br/>(same vendor / name block)"]
+    DB[("SQLite<br/>company records")] --> H
+    H --> P["clean → fuzzy match → features"]
+    P --> R["5 rules"]
+    P --> M["Isolation Forest<br/>(trained on your records)"]
+    R --> E["ensemble<br/>60% rules · 40% model"]
+    M --> E
+    IN --> T["image forensics<br/>tamper model"]
+    E --> V{{"OK · REVIEW · SUSPICIOUS<br/>+ reasons + matches"}}
+    T --> V
 ```
-projecttt/
-├── config.py                      # Centralized configuration & hyperparameters
-├── pipeline.py                    # End-to-end pipeline orchestrator
-├── requirements.txt               # Project dependencies
-├── README.md                      # Comprehensive documentation & benchmarks
-├── database/
-│   ├── schema.sql                 # Relational schema (vendors, invoices, results, fuzzy pairs)
-│   └── db_manager.py              # SQLite connection manager, WAL mode, CRUD
-├── data/
-│   ├── generate_synthetic_data.py # 100K+ realistic invoices with injected anomalies
-│   └── invoices.db                # SQLite database (generated at runtime, not committed)
-├── preprocessing/
-│   ├── cleaner.py                 # Currency normalization, vendor cleaning, date parsing
-│   ├── data_loader.py             # Database query and ingestion helpers
-│   └── feature_engineer.py        # Vectorized statistical & frequency feature engineering
-├── matching/
-│   └── fuzzy_matcher.py           # Levenshtein + Jaro-Winkler fuzzy reconciliation
-├── detection/
-│   ├── rule_engine.py             # 5 domain rules for duplicates & overpayments
-│   ├── ml_detector.py             # Scikit-learn Isolation Forest model
-│   └── ensemble.py                # 60/40 rule + ML ensemble with risk classification
-└── evaluation/
-    └── metrics.py                 # Precision, recall, F1, confusion matrix, baseline comparison
-```
+
+A new invoice goes through exactly the same scoring as a historical one in a full audit, but only against the records
+that can change its score, so checks stay fast (~2.5 s against 105K records). Full architecture, sequence diagrams and
+design patterns: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+**Tech stack:** Python · pandas/NumPy · scikit-learn (Isolation Forest, random forest) · RapidFuzz (Levenshtein,
+Jaro-Winkler) · RapidOCR on ONNX Runtime · pypdfium2 · Pillow · Streamlit · SQLite. Why each was chosen and what else
+was considered: [ARCHITECTURE §7](docs/ARCHITECTURE.md#7-technology-stack) and [DECISIONS](docs/DECISIONS.md).
 
 ---
 
-## Technologies Used
+## Results and honest limitations
 
-- **Language**: Python 3.10+
-- **Data Manipulation**: Pandas, NumPy
-- **Machine Learning**: Scikit-Learn (`IsolationForest`, `StandardScaler`)
-- **String Similarity**: `rapidfuzz` (C++ optimized Levenshtein, Jaro-Winkler)
-- **Synthetic Data**: `Faker`
-- **Database**: SQLite 3 with WAL Mode & B-tree indexes
+**Rules + anomaly model** on a labelled benchmark of 104,983 synthetic invoices with 5,758 planted anomalies:
+**98.6% precision, 96.5% recall** (exact duplicates 100% recall, near duplicates 99.9%, overpayments 87.3%, bursts
+100%). Fuzzy matching rejected 59.6% of amount/date-close candidate pairs as false duplicates.
+
+> **These numbers are optimistic.** The anomalies were generated alongside the rules that detect them. Real accuracy
+> needs a labelled sample of real payments; the audit reports it automatically when records carry `is_anomaly`.
+
+**On real receipts:** with 377 genuine receipts loaded as history, the audit flags 6 as high risk, 4 of them the same
+receipt recorded twice; re-uploading a receipt already on record is caught as a 100% duplicate.
+
+**Image-tamper model** (held-out test set of real receipts): ROC-AUC 0.735, precision 36.8%, recall 40.0%. It catches
+about 4 in 10 edited receipts and about 1 in 3 of its flags is real, so a tamper flag only ever asks for review.
+Details, including an overfitting analysis: [docs/ML.md](docs/ML.md).
+
+**Known limitations**
+- No login, roles or multi-company separation: run inside a trusted network.
+- Receipts carry vendor names, not IDs: same-name vendors merge; very different spellings become "new vendor".
+- New vendors have no history, so only duplicate checks apply to them.
+- OCR takes ~7–15 s per photo on a laptop CPU and sometimes misreads fields (hence the review form).
+- SQLite: single writer; no migrations or backups built in; data is lost on hosts with ephemeral disks.
+- The tamper model was trained on a research dataset of Malaysian retail receipts; check its terms before commercial use.
+- Full list: [OPERATIONS](docs/OPERATIONS.md), [DATABASE §14](docs/DATABASE.md#14-known-discrepancies-and-debt).
+
+---
+
+## Deployment and security
+
+Run it on a machine inside the company network (`python -m streamlit run app.py`); colleagues open
+`http://<machine>:8501`. Streamlit Community Cloud works for a public demo with sample data only (its disk is wiped
+on restart). There is no authentication and no encryption at rest or in transit; receipt images are processed in
+memory and not stored. Details: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+---
+
+## Roadmap
+
+| Status | Item |
+|---|---|
+| Done | Company-history import (CSV/Excel), receipt checks (photo, PDF, manual, batch), per-company anomaly model, image-tamper model, check log |
+| Done | Config fully wired; anomaly "unusual" flag limited to 1%; indexed history lookups; per-session DB connections |
+| Planned | Login (OIDC) and roles; hosted Postgres with migrations; automated tests in CI; backups |
+| Planned | Exchange-rate table for mixed currencies; fix known schema debts (unused column, default not applied) |
+| Potential | HTTP API around `check_invoices`; ERP connectors and email-inbox intake; content checks for receipts (line items vs total); stronger tamper model with more forged training data |
+
+---
+
+## Documentation
+
+| Document | Contents | Update when you change... |
+|---|---|---|
+| [ARCHITECTURE](docs/ARCHITECTURE.md) | Components, flows, sequence diagrams, patterns, tech stack | module layout, flows, dependencies |
+| [DATABASE](docs/DATABASE.md) | ER diagram, schema, data dictionary, indexes, queries, transactions, lifecycle | `database/schema.sql`, any SQL, importer columns |
+| [ML](docs/ML.md) | Rules, features, anomaly model, tamper model, OCR, evaluation | `detection/`, `forgery/`, `preprocessing/feature_engineer.py`, `intake/` |
+| [REFERENCE](docs/REFERENCE.md) | CLI, Python API, environment variables, `config.py` | CLI arguments, public functions, `config.py` |
+| [OPERATIONS](docs/OPERATIONS.md) | Install, troubleshooting, deployment, security, testing, observability, performance, failure handling | `requirements.txt`, `packages.txt`, `app.py`, tests |
+| [DECISIONS](docs/DECISIONS.md) | Architecture decision records | any significant design choice |
+| [COMPARISON](docs/COMPARISON.md) | Alternatives, with sources | positioning (re-verify sources yearly) |
+| [GLOSSARY](docs/GLOSSARY.md) | Terms and acronyms | new concepts |
+
+---
+
+## Data and credits
+
+- Receipt forgery data: *Find it again! A Receipt Dataset for Document Forgery Detection*, B. Martínez Tornés et al.,
+  ICDAR 2023, L3i, University of La Rochelle, built on the SROIE receipts.
+  [Dataset page](https://l3i-share.univ-lr.fr/2023Finditagain/index.html). Published for research.
+- OCR: [RapidOCR](https://github.com/RapidAI/RapidOCR) (PaddleOCR models on ONNX Runtime).
+- String similarity: [RapidFuzz](https://github.com/rapidfuzz/RapidFuzz). Models: [scikit-learn](https://scikit-learn.org/).
+
+## License
+
+No license file has been added yet, so all rights are reserved by the author by default.
