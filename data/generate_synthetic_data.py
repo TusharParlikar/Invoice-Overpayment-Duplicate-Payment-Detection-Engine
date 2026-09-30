@@ -34,7 +34,9 @@ def generate_name_variants(name: str):
 
     variants.append(name + " LLC")
     variants.append(name.replace(" ", ""))
-    return list(set(variants))
+    # dict.fromkeys dedupes in insertion order; set order changes per process (hash randomization),
+    # which made random.choice(variants) pick different names on every run despite RANDOM_SEED.
+    return list(dict.fromkeys(variants))
 
 
 def generate_all_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
