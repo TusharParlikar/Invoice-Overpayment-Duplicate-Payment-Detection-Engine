@@ -15,9 +15,17 @@ env/
 venv/
 
 
-# Generated database (rebuilt by `python pipeline.py`)
+# Company records database (real invoice data: never commit)
 *.db
+
+# Downloaded datasets and local test samples (dataset-derived images, answer keys)
+data/raw/
+data/samples/
+
+# Anomaly model is trained on each company's own records; the tamper model ships
+models/anomaly.joblib
 
 # Personal notes
 github.md
 project.md
+PRODUCT_GUIDE.md

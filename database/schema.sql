@@ -1,8 +1,5 @@
--- Each pipeline run regenerates the data, so start from empty tables (children first for FKs).
-DROP TABLE IF EXISTS detection_results;
-DROP TABLE IF EXISTS fuzzy_match_pairs;
-DROP TABLE IF EXISTS invoices;
-DROP TABLE IF EXISTS vendors;
+-- Records persist across runs (real imported data). Only detection_results and
+-- fuzzy_match_pairs are rebuilt by each audit; see DatabaseManager.write_*.
 
 CREATE TABLE IF NOT EXISTS vendors (
     vendor_id TEXT PRIMARY KEY,
@@ -17,15 +14,18 @@ CREATE TABLE IF NOT EXISTS invoices (
     vendor_id TEXT NOT NULL,
     vendor_name TEXT NOT NULL,
     invoice_date TEXT NOT NULL,
-    due_date TEXT NOT NULL,
+    due_date TEXT,
     amount REAL NOT NULL,
     currency TEXT DEFAULT 'USD',
     department TEXT,
     po_number TEXT,
     payment_status TEXT DEFAULT 'pending',
     erp_source TEXT,
-    is_anomaly INTEGER DEFAULT 0,
+    -- Optional ground-truth labels (1 = known bad). NULL = unlabelled, the normal case.
+    is_anomaly INTEGER,
     anomaly_type TEXT,
+    source TEXT,
+    imported_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (vendor_id) REFERENCES vendors(vendor_id)
 );
 
@@ -53,7 +53,30 @@ CREATE TABLE IF NOT EXISTS fuzzy_match_pairs (
     FOREIGN KEY (record_b_id) REFERENCES invoices(id)
 );
 
+-- Every receipt checked through the app, with its verdict.
+CREATE TABLE IF NOT EXISTS receipt_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    source TEXT,
+    file_name TEXT,
+    invoice_id TEXT,
+    vendor_name TEXT,
+    invoice_date TEXT,
+    amount REAL,
+    currency TEXT,
+    final_score REAL,
+    risk_category TEXT,
+    flags TEXT,
+    tamper_score REAL,
+    verdict TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_invoices_vendor_id ON invoices(vendor_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_invoice_date ON invoices(invoice_date);
 CREATE INDEX IF NOT EXISTS idx_invoices_amount ON invoices(amount);
 CREATE INDEX IF NOT EXISTS idx_invoices_invoice_id ON invoices(invoice_id);
+-- Receipt checks load history by vendor_id OR vendor_name (detection/checker.py _relevant_history);
+-- without this index the OR forces a full table scan.
+CREATE INDEX IF NOT EXISTS idx_invoices_vendor_name ON invoices(vendor_name);
+-- Records tab joins results to invoices.
+CREATE INDEX IF NOT EXISTS idx_detection_results_invoice ON detection_results(invoice_row_id);

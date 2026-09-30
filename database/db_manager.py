@@ -65,10 +65,13 @@ class DatabaseManager:
             raise
 
     def bulk_insert_vendors(self, vendors_df: pd.DataFrame):
-        """Bulk insert vendors from DataFrame."""
+        """Insert vendors, skipping vendor_ids that already exist."""
+        cols = list(vendors_df.columns)
+        sql = f"INSERT OR IGNORE INTO vendors ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})"
         try:
-            vendors_df.to_sql('vendors', self.conn, if_exists='append', index=False, chunksize=500)
-            logger.info(f"Successfully inserted {len(vendors_df)} vendors.")
+            with self.conn:
+                self.conn.executemany(sql, vendors_df.itertuples(index=False, name=None))  # SQLite stores NaN as NULL
+            logger.info(f"Upserted {len(vendors_df)} vendors.")
         except Exception as e:
             logger.error(f"Failed to insert vendors: {e}")
             raise
@@ -97,9 +100,13 @@ class DatabaseManager:
         query = "SELECT * FROM invoices WHERE invoice_date BETWEEN ? AND ?"
         return self.execute_query(query, params=(start_date, end_date))
 
+    def count_invoices(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0]
+
     def write_detection_results(self, results_df: pd.DataFrame):
-        """Bulk insert detection results."""
+        """Replace detection results with this audit's results."""
         try:
+            self.conn.execute("DELETE FROM detection_results")
             results_df.to_sql('detection_results', self.conn, if_exists='append', index=False, chunksize=500)
             logger.info(f"Successfully inserted {len(results_df)} detection results.")
         except Exception as e:
@@ -107,13 +114,18 @@ class DatabaseManager:
             raise
 
     def write_fuzzy_matches(self, matches_df: pd.DataFrame):
-        """Bulk insert fuzzy match pairs."""
+        """Replace fuzzy match pairs with this audit's pairs."""
         try:
+            self.conn.execute("DELETE FROM fuzzy_match_pairs")
             matches_df.to_sql('fuzzy_match_pairs', self.conn, if_exists='append', index=False, chunksize=500)
             logger.info(f"Successfully inserted {len(matches_df)} fuzzy match pairs.")
         except Exception as e:
             logger.error(f"Failed to write fuzzy matches: {e}")
             raise
+
+    def log_receipt_check(self, row: dict):
+        """Record one receipt check (see receipt_checks in schema.sql)."""
+        pd.DataFrame([row]).to_sql('receipt_checks', self.conn, if_exists='append', index=False)
 
     def execute_query(self, query: str, params: tuple = None) -> pd.DataFrame:
         """Execute a query and return results as DataFrame."""
