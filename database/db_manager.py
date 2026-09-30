@@ -35,6 +35,8 @@ class DatabaseManager:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA foreign_keys=ON")
+            # 64 MB page cache: the default 2 MB thrashes while maintaining 4 indexes on 100K+ inserts (~3x slower)
+            self.conn.execute("PRAGMA cache_size=-65536")
             logger.info(f"Connected to database at {self.db_path} with WAL mode enabled.")
         except sqlite3.Error as e:
             logger.error(f"Error connecting to DB: {e}")
