@@ -57,16 +57,13 @@ class EnsembleDetector:
         """Combine rule flags and ML anomaly predictions into comprehensive audit tag."""
         result_df = df.copy()
 
-        def _combine(row):
-            rule_flags = str(row.get("rule_flags", "none"))
-            flags = [f.strip() for f in rule_flags.split(",") if f.strip() and f.strip() != "none"]
+        idx = result_df.index
+        rule = result_df["rule_flags"].astype(str) if "rule_flags" in result_df.columns else pd.Series("none", index=idx)
+        rule = rule.mask(rule == "none", "")
+        ml = result_df["ml_prediction"] == -1 if "ml_prediction" in result_df.columns else pd.Series(False, index=idx)
 
-            if row.get("ml_prediction", 1) == -1:
-                flags.append("ml_isolation_forest")
-
-            return ",".join(flags) if flags else "none"
-
-        result_df["all_flags"] = result_df.apply(_combine, axis=1)
+        flags = rule.mask(ml, (rule + ",ml_isolation_forest").str.lstrip(","))
+        result_df["all_flags"] = flags.mask(flags == "", "none")
         return result_df
 
     def run_ensemble(self, df: pd.DataFrame) -> pd.DataFrame:

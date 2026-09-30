@@ -42,12 +42,7 @@ class RuleEngine:
             return scores
 
         # Map to record_b_id (the duplicate copy)
-        id_to_score = {}
-        for _, row in fuzzy_matches.iterrows():
-            sim = row["similarity_score"]
-            b_id = int(row["record_b_id"])
-            id_to_score[b_id] = max(id_to_score.get(b_id, 0.0), sim)
-
+        id_to_score = fuzzy_matches.groupby("record_b_id")["similarity_score"].max()
         scores = df["id"].map(id_to_score).fillna(0.0)
         scores.index = df.index
         return scores
@@ -124,18 +119,18 @@ class RuleEngine:
 
         result["rule_score"] = result[rule_cols].max(axis=1).clip(upper=1.0)
 
-        def _flags(row):
-            names = {
-                "rule_exact_dup": "exact_dup",
-                "rule_near_dup": "near_dup",
-                "rule_overpayment": "overpayment",
-                "rule_rapid_fire": "rapid_fire",
-                "rule_round_number": "round_number",
-            }
-            fired = [label for col, label in names.items() if row[col] > 0]
-            return ",".join(fired) if fired else "none"
-
-        result["rule_flags"] = result.apply(_flags, axis=1)
+        names = {
+            "rule_exact_dup": "exact_dup",
+            "rule_near_dup": "near_dup",
+            "rule_overpayment": "overpayment",
+            "rule_rapid_fire": "rapid_fire",
+            "rule_round_number": "round_number",
+        }
+        flags = pd.Series("", index=result.index, dtype=object)
+        for col, label in names.items():
+            flags += np.where(result[col] > 0, label + ",", "")
+        flags = flags.str.rstrip(",")
+        result["rule_flags"] = flags.mask(flags == "", "none")
 
         for col in rule_cols:
             cnt = int((result[col] > 0).sum())
