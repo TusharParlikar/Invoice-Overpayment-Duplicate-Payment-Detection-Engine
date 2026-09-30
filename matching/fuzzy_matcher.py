@@ -24,6 +24,11 @@ class FuzzyMatcher:
         self.LEVENSHTEIN_WEIGHT = config.LEVENSHTEIN_WEIGHT
         self.JARO_WINKLER_WEIGHT = config.JARO_WINKLER_WEIGHT
         self.BLOCKING_KEY_LENGTH = config.BLOCKING_KEY_LENGTH
+        self.AMOUNT_TOLERANCE = config.NEAR_DUP_AMOUNT_TOLERANCE
+        self.DATE_WINDOW_DAYS = config.NEAR_DUP_DATE_WINDOW_DAYS
+        self.ID_MATCH = config.INVOICE_ID_MATCH_THRESHOLD
+        self.ID_SUPPORT = config.INVOICE_ID_SUPPORT_THRESHOLD
+        self.NAME_STRICT = config.VENDOR_NAME_STRICT_THRESHOLD
         self.candidate_count = 0
         self.confirmed_count = 0
 
@@ -38,14 +43,15 @@ class FuzzyMatcher:
     def find_potential_duplicates(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         """Find near-duplicate invoice pairs across inconsistent ERP formats.
 
-        1. Candidates: Invoices sharing blocking key or vendor, amount within 0.5%, date within 7 days.
-        2. Verification:
-           - Cross-ERP Invoice ID fuzzy match (Levenshtein >= 85% or dash-normalized match)
-           - Vendor name variation match (Levenshtein + Jaro-Winkler >= 85%)
-        3. Pruning: Candidate pairs failing fuzzy reconciliation are rejected as false duplicates,
-           cutting false-duplicate flags by 40%+.
-        4. Orientation: Correctly identifies the subsequent invoice as record_b (duplicate)
-           and earlier invoice as record_a (original).
+        1. Candidates: invoices in the same blocking key (vendor-name prefix), amounts within
+           NEAR_DUP_AMOUNT_TOLERANCE, dates within NEAR_DUP_DATE_WINDOW_DAYS (config.py).
+        2. Verification, any of:
+           - same vendor and invoice numbers equal after removing dashes/spaces (SAP-2024-1 = SAP20241)
+           - same vendor and invoice numbers >= INVOICE_ID_MATCH_THRESHOLD similar (Levenshtein)
+           - vendor names >= FUZZY_THRESHOLD similar (Levenshtein + Jaro-Winkler; across different
+             vendor IDs only >= VENDOR_NAME_STRICT_THRESHOLD) and numbers >= INVOICE_ID_SUPPORT_THRESHOLD
+        3. Pruning: candidate pairs that fail verification are not flagged (false duplicates).
+        4. Orientation: the later-dated invoice is record_b (the duplicate), the earlier record_a.
         """
         cols_out = [
             "record_a_id", "record_b_id", "similarity_score",
@@ -83,7 +89,7 @@ class FuzzyMatcher:
             n = len(ids)
             for i in range(n):
                 curr_amt = amts[i]
-                max_amt = curr_amt * 1.005 + 0.01
+                max_amt = curr_amt * (1 + self.AMOUNT_TOLERANCE) + 0.01
 
                 j = i + 1
                 while j < n and amts[j] <= max_amt:
@@ -92,8 +98,7 @@ class FuzzyMatcher:
                         j += 1
                         continue
 
-                    # Date window <= 7 days
-                    if abs(dates[j] - dates[i]) <= 7:
+                    if abs(dates[j] - dates[i]) <= self.DATE_WINDOW_DAYS:
                         total_candidates += 1
 
                         # Cross-ERP normalized ID match (e.g. SAP-2024-123456 vs SAP2024123456)
@@ -101,13 +106,13 @@ class FuzzyMatcher:
 
                         # Fuzzy match invoice IDs (e.g. trailing -A or typo across ERPs)
                         id_sim = fuzz.ratio(clean_ids[i], clean_ids[j]) / 100.0
-                        is_fuzzy_id_match = (id_sim >= 0.85) and (v_ids[i] == v_ids[j])
+                        is_fuzzy_id_match = (id_sim >= self.ID_MATCH) and (v_ids[i] == v_ids[j])
 
                         # Fuzzy match vendor names across inconsistent ERPs
                         sim = self._compute_similarity(str(vnames[i]), str(vnames[j]))
-                        is_vendor_near_dup = (sim["combined"] >= self.FUZZY_THRESHOLD) and (v_ids[i] == v_ids[j] or sim["combined"] >= 0.90)
+                        is_vendor_near_dup = (sim["combined"] >= self.FUZZY_THRESHOLD) and (v_ids[i] == v_ids[j] or sim["combined"] >= self.NAME_STRICT)
 
-                        if is_norm_id_match or is_fuzzy_id_match or (is_vendor_near_dup and id_sim >= 0.70):
+                        if is_norm_id_match or is_fuzzy_id_match or (is_vendor_near_dup and id_sim >= self.ID_SUPPORT):
                             best_score = max(sim["combined"], id_sim if is_fuzzy_id_match else (1.0 if is_norm_id_match else 0.0))
                             match_type = "cross_erp_id" if (is_norm_id_match or is_fuzzy_id_match) else "vendor_variant"
 

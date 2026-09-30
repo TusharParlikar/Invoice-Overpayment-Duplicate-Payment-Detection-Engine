@@ -15,15 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 class RuleEngine:
-    def __init__(self):
-        self.NEAR_DUP_AMOUNT_TOLERANCE = config.NEAR_DUP_AMOUNT_TOLERANCE
-        self.NEAR_DUP_DATE_WINDOW_DAYS = config.NEAR_DUP_DATE_WINDOW_DAYS
-        self.FUZZY_THRESHOLD = config.FUZZY_THRESHOLD
-        self.OVERPAYMENT_MULTIPLIER = config.OVERPAYMENT_MULTIPLIER
-        self.RAPID_FIRE_MIN_COUNT = config.RAPID_FIRE_MIN_COUNT
-        self.RAPID_FIRE_HOURS = config.RAPID_FIRE_HOURS
-        self.ROUND_NUMBER_THRESHOLD = config.ROUND_NUMBER_THRESHOLD
-
     def rule_exact_duplicate(self, df: pd.DataFrame) -> pd.Series:
         """Flag duplicate copies of identical (vendor_id, invoice_id, amount) submissions."""
         scores = pd.Series(0.0, index=df.index)
@@ -62,18 +53,17 @@ class RuleEngine:
             ratio = df[amt_col] / v_med
             zscore = (df[amt_col] - v_med) / v_std
 
-        # Injected overpayments are 3.5x to 6.5x vendor base
-        mask = (ratio >= 3.0) & (zscore >= 3.5)
+        mask = (ratio >= config.OVERPAYMENT_MULTIPLIER) & (zscore >= config.OVERPAYMENT_MIN_ZSCORE)
         over_scores = (ratio - 1.0).clip(lower=0.0, upper=5.0) / 5.0
         scores[mask] = np.maximum(0.85, over_scores[mask])
         return scores
 
     def rule_rapid_fire(self, df: pd.DataFrame) -> pd.Series:
-        """Flag rapid burst submissions (multiple invoices on the same PO within 24h)."""
+        """Flag bursts: several invoices from one vendor on the same PO and the same date."""
         scores = pd.Series(0.0, index=df.index)
         if "po_number" in df.columns and "invoice_date" in df.columns:
             cluster_count = df.groupby(["vendor_id", "po_number", "invoice_date"])["invoice_id"].transform("count")
-            mask = cluster_count >= 3
+            mask = cluster_count >= config.RAPID_FIRE_MIN_COUNT
             scores[mask] = 0.90
         elif "days_since_last_invoice" in df.columns and "vendor_invoice_count_30d" in df.columns:
             mask = (df["days_since_last_invoice"] == 0) & (df["vendor_invoice_count_30d"] >= 4)
@@ -85,9 +75,9 @@ class RuleEngine:
         scores = pd.Series(0.0, index=df.index)
         amt_col = "amount_usd" if "amount_usd" in df.columns else "amount"
 
-        is_round = (df[amt_col] >= 25000.0) & (df[amt_col] % 5000 == 0)
+        is_round = (df[amt_col] >= config.ROUND_NUMBER_MIN_AMOUNT) & (df[amt_col] % config.ROUND_NUMBER_STEP == 0)
         if "amount_to_vendor_median" in df.columns:
-            mask = is_round & (df["amount_to_vendor_median"] >= 2.5)
+            mask = is_round & (df["amount_to_vendor_median"] >= config.ROUND_NUMBER_MIN_MEDIAN_RATIO)
         else:
             mask = is_round
         scores[mask] = 0.65

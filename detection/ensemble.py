@@ -32,8 +32,8 @@ class EnsembleDetector:
 
         # High-confidence rule triggers (exact dup, near dup, confirmed overpayment)
         # receive high confidence in the final score
-        high_rule = rule_score >= 0.80
-        final_score = np.where(high_rule, np.maximum(final_score, 0.88), final_score)
+        high_rule = rule_score >= config.STRONG_RULE_SCORE
+        final_score = np.where(high_rule, np.maximum(final_score, config.STRONG_RULE_FLOOR), final_score)
 
         result_df["final_score"] = final_score
         return result_df
