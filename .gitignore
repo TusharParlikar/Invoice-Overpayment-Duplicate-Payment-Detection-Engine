@@ -14,3 +14,9 @@ __pycache__/
 env/
 venv/
 
+
+# Generated database (rebuilt by `python pipeline.py`)
+*.db
+
+# Local upload notes
+github.md
