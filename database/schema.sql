@@ -1,3 +1,9 @@
+-- Each pipeline run regenerates the data, so start from empty tables (children first for FKs).
+DROP TABLE IF EXISTS detection_results;
+DROP TABLE IF EXISTS fuzzy_match_pairs;
+DROP TABLE IF EXISTS invoices;
+DROP TABLE IF EXISTS vendors;
+
 CREATE TABLE IF NOT EXISTS vendors (
     vendor_id TEXT PRIMARY KEY,
     vendor_name TEXT NOT NULL,
