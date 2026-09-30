@@ -13,9 +13,9 @@
 
 ## Key Highlights & Benchmarks
 
-- **104,983 Invoices Audited**: Processed end-to-end in **under 45 seconds**.
+- **104,983 Invoices Audited**: Processed end-to-end in **about 15 seconds**.
 - **98.6% Precision** (exceeds 91% requirement): High confidence detection with minimal false alarms (79 false positives out of 99,225 clean records).
-- **96.5% Recall**: Detected **5,557 out of 5,758** injected anomalies across all fraud categories.
+- **96.5% Recall**: Detected **5,556 out of 5,758** injected anomalies across all fraud categories.
 - **59.6% Reduction in False-Duplicate Flags**: Applied Levenshtein and Jaro-Winkler string similarity to reconcile vendor name variations and cross-ERP invoice ID formats, eliminating 2,470 false candidate matches.
 - **Full Data Persistence**: SQLite relational database with WAL mode, indexing, and complete audit trail.
 
@@ -54,7 +54,7 @@
   - **Blocking Strategy**: Groups by 3-character prefix keys to reduce comparison complexity from $\mathcal{O}(N^2)$ to sparse candidate windows.
   - **Dual Metric Similarity**: Combines Levenshtein ratio ($40\%$) and Jaro-Winkler similarity ($60\%$) via `rapidfuzz`.
   - **Cross-ERP ID Normalization**: Strips delimiters and applies sequence alignment.
-  - **False Duplicate Pruning**: Evaluated 4,142 candidate pairs, confirmed 1,672 true cross-ERP duplicates, and pruned 2,470 false matches (**59.6% reduction in false-duplicate flags**).
+  - **False Duplicate Pruning**: Evaluated 4,141 candidate pairs, confirmed 1,671 true cross-ERP duplicates, and pruned 2,470 false matches (**59.6% reduction in false-duplicate flags**).
 
 ### 2. Rule-Based Engine (`detection/rule_engine.py`)
 Five specialized domain rules:
@@ -97,8 +97,8 @@ Run on **104,983 invoices** with **5,758 injected ground-truth anomalies**:
 
 --- Overall Detection Performance ---
   Precision: 0.9860  (98.6%)
-  Recall:    0.9651  (96.5%)
-  F1 Score:  0.9754
+  Recall:    0.9649  (96.5%)
+  F1 Score:  0.9753
 
 --- Breakdown by Anomaly Type ---
   Anomaly Category   | Precision  | Recall     | F1         | Count
@@ -110,19 +110,19 @@ Run on **104,983 invoices** with **5,758 injected ground-truth anomalies**:
 
 --- Confusion Matrix ---
   True Negatives (TN) : 99,146 | False Positives (FP):     79
-  False Negatives (FN):    201 | True Positives (TP) :  5,557
+  False Negatives (FN):    202 | True Positives (TP) :  5,556
 
 --- Summary ---
   Total Invoices Audited : 104,983
-  Invoices Flagged Risk  : 5,636 (5.37% flag rate)
-  True Anomalies Caught  : 5,557 of 5,758 (96.5%)
+  Invoices Flagged Risk  : 5,635 (5.37% flag rate)
+  True Anomalies Caught  : 5,556 of 5,758 (96.5%)
 ============================================================
 
 ============================================================
   FUZZY MATCHING IMPACT VS NAIVE BASELINE
 ============================================================
-  Candidate pairs evaluated (amount & date proximity) : 4,142
-  Pairs confirmed by fuzzy matching (Levenshtein + JW) : 1,672
+  Candidate pairs evaluated (amount & date proximity) : 4,141
+  Pairs confirmed by fuzzy matching (Levenshtein + JW) : 1,671
   False-duplicate matches eliminated                   : 2,470
   False-Duplicate Flag Reduction                       : 59.6%
 ============================================================
@@ -131,16 +131,16 @@ Run on **104,983 invoices** with **5,758 injected ground-truth anomalies**:
 ### Execution Speed
 | Pipeline Stage | Records Processed | Runtime |
 |---|---|---|
-| Synthetic Data Generation & DB Insert | 104,983 invoices, 2,500 vendors | 13.57s |
-| Data Cleaning & Normalization | 104,983 invoices | 5.35s |
-| Fuzzy Matching (Levenshtein + JW) | 4,142 candidate pairs | 4.60s |
-| Vectorized Feature Engineering | 7 behavioral/statistical features | 0.47s |
-| Rule Engine (5 Rules) | 104,983 invoices | 3.37s |
-| ML Isolation Forest | 104,983 invoices | 9.62s |
-| Ensemble Scoring & Risk Categorization | 104,983 invoices | 2.15s |
-| Evaluation Metrics & Baseline Comparison | 104,983 invoices | 3.85s |
-| SQLite Result Persistence | 104,983 detection results, 1,672 pairs | 0.91s |
-| **Total End-to-End Pipeline** | **104,983 Invoices** | **43.89s** |
+| Synthetic Data Generation & DB Insert | 104,983 invoices, 2,500 vendors | 6.84s |
+| Data Cleaning & Normalization | 104,983 invoices | 0.64s |
+| Fuzzy Matching (Levenshtein + JW) | 4,141 candidate pairs | 1.19s |
+| Vectorized Feature Engineering | 7 behavioral/statistical features | 0.45s |
+| Rule Engine (5 Rules) | 104,983 invoices | 0.51s |
+| ML Isolation Forest | 104,983 invoices | 3.77s |
+| Ensemble Scoring & Risk Categorization | 104,983 invoices | 0.24s |
+| Evaluation Metrics & Baseline Comparison | 104,983 invoices | 0.74s |
+| SQLite Result Persistence | 104,983 detection results, 1,671 pairs | 0.69s |
+| **Total End-to-End Pipeline** | **104,983 Invoices** | **15.08s** |
 
 ---
 
@@ -165,6 +165,7 @@ Required packages:
 ```bash
 python pipeline.py
 ```
+Each run rebuilds `data/invoices.db` from scratch. Output is fully reproducible: the same `RANDOM_SEED` gives identical data and results on every run.
 
 ### 4. Query the Database
 The pipeline creates and populates `data/invoices.db` (SQLite):
@@ -172,17 +173,37 @@ The pipeline creates and populates `data/invoices.db` (SQLite):
 ```python
 from database.db_manager import DatabaseManager
 
-db = DatabaseManager()
-# Get all high-risk flagged invoices
-high_risk = db.execute_query("""
-    SELECT i.invoice_id, i.vendor_name, i.amount, d.final_score, d.risk_category, d.flags
-    FROM invoices i
-    JOIN detection_results d ON i.id = d.invoice_row_id
-    WHERE d.risk_category = 'HIGH'
-    ORDER BY d.final_score DESC
-""")
-print(high_risk.head())
+with DatabaseManager() as db:
+    # Highest-risk flagged invoices
+    high_risk = db.execute_query("""
+        SELECT i.invoice_id, i.vendor_name, i.amount, d.final_score, d.risk_category, d.flags
+        FROM invoices i
+        JOIN detection_results d ON i.id = d.invoice_row_id
+        WHERE d.risk_category = 'HIGH'
+        ORDER BY d.final_score DESC
+        LIMIT 10
+    """)
+    print(high_risk)
+
+    # Cross-ERP duplicate pairs reconciled by the fuzzy matcher
+    fuzzy_pairs = db.execute_query("""
+        SELECT a.invoice_id AS original_inv, b.invoice_id AS duplicate_inv,
+               f.similarity_score, f.match_type
+        FROM fuzzy_match_pairs f
+        JOIN invoices a ON f.record_a_id = a.id
+        JOIN invoices b ON f.record_b_id = b.id
+        LIMIT 10
+    """)
+    print(fuzzy_pairs)
 ```
+
+### 5. Tuning
+Settings live in `config.py`:
+- **Fuzzy match strictness**: `FUZZY_THRESHOLD` (default `0.85`).
+- **Rules vs. ML influence**: `ENSEMBLE_RULE_WEIGHT` / `ENSEMBLE_ML_WEIGHT` (default `0.6` / `0.4`).
+- **Risk bands**: `RISK_HIGH_THRESHOLD` / `RISK_MEDIUM_THRESHOLD` (default `0.7` / `0.4`).
+- **Isolation Forest**: `ISOLATION_FOREST_N_ESTIMATORS`, `ISOLATION_FOREST_CONTAMINATION`.
+- **Dataset**: `NUM_RECORDS`, the per-anomaly `*_RATE` values, and `RANDOM_SEED`.
 
 ---
 
@@ -199,7 +220,7 @@ projecttt/
 │   └── db_manager.py              # SQLite connection manager, WAL mode, CRUD
 ├── data/
 │   ├── generate_synthetic_data.py # 100K+ realistic invoices with injected anomalies
-│   └── invoices.db                # SQLite database (generated at runtime)
+│   └── invoices.db                # SQLite database (generated at runtime, not committed)
 ├── preprocessing/
 │   ├── cleaner.py                 # Currency normalization, vendor cleaning, date parsing
 │   ├── data_loader.py             # Database query and ingestion helpers
