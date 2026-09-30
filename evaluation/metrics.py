@@ -66,30 +66,33 @@ class Evaluator:
         if "is_anomaly" not in df.columns or "final_score" not in df.columns:
             return 0.70
 
-        y_true = df["is_anomaly"].astype(int)
+        # Plain numpy counts: sklearn's metric validation dominates when called 45+ times on 100K rows
+        y_true = df["is_anomaly"].to_numpy(dtype=bool)
+        scores = df["final_score"].to_numpy()
+        n_pos = y_true.sum()
         best_t = 0.70
         best_f1 = 0.0
+        max_p = 0.0
+        best_p_t = None
 
         for t in np.arange(0.50, 0.95, 0.01):
-            y_pred = (df["final_score"] >= t).astype(int)
-            if y_pred.sum() == 0:
+            y_pred = scores >= t
+            n_pred = y_pred.sum()
+            if n_pred == 0:
                 continue
-            p = precision_score(y_true, y_pred, zero_division=0)
-            f1 = f1_score(y_true, y_pred, zero_division=0)
+            tp = (y_pred & y_true).sum()
+            p = tp / n_pred
+            f1 = 2 * tp / (n_pred + n_pos)
             if p >= target_precision and f1 > best_f1:
                 best_f1 = f1
                 best_t = t
+            if p > max_p:
+                max_p = p
+                best_p_t = t
 
-        if best_f1 == 0.0:
-            max_p = 0.0
-            for t in np.arange(0.50, 0.95, 0.01):
-                y_pred = (df["final_score"] >= t).astype(int)
-                if y_pred.sum() == 0:
-                    continue
-                p = precision_score(y_true, y_pred, zero_division=0)
-                if p > max_p:
-                    max_p = p
-                    best_t = t
+        # No threshold reached the target precision: fall back to the most precise one
+        if best_f1 == 0.0 and best_p_t is not None:
+            best_t = best_p_t
 
         return round(float(best_t), 2)
 
