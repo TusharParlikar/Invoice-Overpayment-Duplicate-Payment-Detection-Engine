@@ -90,11 +90,12 @@ def generate_all_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     # 1. Normal Invoices
     # Distribute normal invoices across vendors
-    vendor_indices = np.random.choice(len(vendors), size=num_normal)
-    day_offsets = np.random.randint(0, total_days, size=num_normal)
-    dept_choices = np.random.choice(departments, size=num_normal)
-    status_choices = np.random.choice(statuses, size=num_normal)
-    curr_choices = np.random.choice(["USD", "EUR", "GBP"], size=num_normal, p=[0.95, 0.03, 0.02])
+    # .tolist(): numpy scalar indexing is slow inside the per-row loop below
+    vendor_indices = np.random.choice(len(vendors), size=num_normal).tolist()
+    day_offsets = np.random.randint(0, total_days, size=num_normal).tolist()
+    dept_choices = np.random.choice(departments, size=num_normal).tolist()
+    status_choices = np.random.choice(statuses, size=num_normal).tolist()
+    curr_choices = np.random.choice(["USD", "EUR", "GBP"], size=num_normal, p=[0.95, 0.03, 0.02]).tolist()
 
     for i in range(num_normal):
         v = vendors[vendor_indices[i]]
@@ -144,9 +145,10 @@ def generate_all_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
     # 3. Near Duplicates (~1.5%)
     # Same vendor but different name variant (across ERPs), slightly varied ID, date within 1-5 days, same amount
     near_sample = random.choices([inv for inv in invoices if inv["is_anomaly"] == 0], k=num_near)
+    vendors_by_id = {item["vendor_id"]: item for item in vendors}
     for base in near_sample:
         dup = base.copy()
-        v = next(item for item in vendors if item["vendor_id"] == base["vendor_id"])
+        v = vendors_by_id[base["vendor_id"]]
         other_variants = [var for var in v["variants"] if var != base["vendor_name"]]
         if other_variants:
             dup["vendor_name"] = random.choice(other_variants)
