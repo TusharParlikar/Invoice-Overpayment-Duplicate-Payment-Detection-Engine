@@ -17,9 +17,11 @@ class MLDetector:
         self.contamination = config.ISOLATION_FOREST_CONTAMINATION
         self.random_state = config.ISOLATION_FOREST_RANDOM_STATE
         
+        # contamination="auto" skips the scoring pass fit() would run to place its cutoff;
+        # detect_anomalies applies self.contamination itself from a single score_samples pass.
         self.model = IsolationForest(
             n_estimators=self.n_estimators,
-            contamination=self.contamination,
+            contamination="auto",
             random_state=self.random_state
         )
         self.scaler = StandardScaler()
@@ -31,8 +33,6 @@ class MLDetector:
         ]
 
     def prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        available_cols = [c for c in self.FEATURE_COLUMNS if c in df.columns]
-        
         features_df = pd.DataFrame(index=df.index)
         for col in self.FEATURE_COLUMNS:
             if col in df.columns:
@@ -52,9 +52,11 @@ class MLDetector:
         
         X = self.prepare_features(result_df)
         
+        # Identical to fit(contamination=c) + decision_function + predict, but scores the 200 trees once instead of 3x
         self.model.fit(X)
-        preds = self.model.predict(X)
-        raw_scores = self.model.decision_function(X)
+        samples = self.model.score_samples(X)
+        raw_scores = samples - np.percentile(samples, 100.0 * self.contamination)
+        preds = np.where(raw_scores < 0, -1, 1)
         
         min_score = raw_scores.min()
         max_score = raw_scores.max()
