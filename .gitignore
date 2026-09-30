@@ -18,5 +18,6 @@ venv/
 # Generated database (rebuilt by `python pipeline.py`)
 *.db
 
-# Local upload notes
+# Personal notes
 github.md
+project.md
