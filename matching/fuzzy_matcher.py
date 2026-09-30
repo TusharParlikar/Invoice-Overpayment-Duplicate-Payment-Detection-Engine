@@ -12,7 +12,6 @@ import pandas as pd
 import numpy as np
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
-from collections import defaultdict
 import logging
 import config
 
@@ -27,12 +26,6 @@ class FuzzyMatcher:
         self.BLOCKING_KEY_LENGTH = config.BLOCKING_KEY_LENGTH
         self.candidate_count = 0
         self.confirmed_count = 0
-
-    def _blocking_key(self, name: str) -> str:
-        if not isinstance(name, str) or not name:
-            return ""
-        cleaned = name.lower().strip()
-        return cleaned[:self.BLOCKING_KEY_LENGTH]
 
     def _compute_similarity(self, name_a: str, name_b: str) -> dict:
         if not name_a or not name_b:
@@ -65,12 +58,10 @@ class FuzzyMatcher:
         vname_col = "vendor_name_clean" if "vendor_name_clean" in df.columns else "vendor_name"
 
         work_df = df[["id", "invoice_id", "vendor_id", vname_col, "invoice_date", amt_col]].copy()
-        work_df["invoice_date"] = pd.to_datetime(work_df["invoice_date"])
-        work_df["block_key"] = work_df[vname_col].astype(str).apply(self._blocking_key)
-
-        def _clean_id(x):
-            return str(x).replace("-", "").replace(" ", "").upper()
-        work_df["clean_id"] = work_df["invoice_id"].apply(_clean_id)
+        # Whole days as ints: the pair loop below compares dates for every pair in the amount window
+        work_df["invoice_date"] = pd.to_datetime(work_df["invoice_date"]).values.astype("datetime64[D]").astype(np.int64)
+        work_df["block_key"] = work_df[vname_col].astype(str).str.lower().str.strip().str[:self.BLOCKING_KEY_LENGTH]
+        work_df["clean_id"] = work_df["invoice_id"].astype(str).str.replace("-", "").str.replace(" ", "").str.upper()
 
         confirmed_matches = []
         total_candidates = 0
@@ -79,14 +70,15 @@ class FuzzyMatcher:
             if not bkey or len(group) < 2:
                 continue
 
+            # Plain Python lists: scalar access on numpy arrays is several times slower in this loop
             group_sorted = group.sort_values(amt_col)
-            ids = group_sorted["id"].values
-            raw_ids = group_sorted["invoice_id"].values
-            clean_ids = group_sorted["clean_id"].values
-            amts = group_sorted[amt_col].values
-            dates = group_sorted["invoice_date"].values
-            vnames = group_sorted[vname_col].values
-            v_ids = group_sorted["vendor_id"].values
+            ids = group_sorted["id"].tolist()
+            raw_ids = group_sorted["invoice_id"].tolist()
+            clean_ids = group_sorted["clean_id"].tolist()
+            amts = group_sorted[amt_col].tolist()
+            dates = group_sorted["invoice_date"].tolist()
+            vnames = group_sorted[vname_col].tolist()
+            v_ids = group_sorted["vendor_id"].tolist()
 
             n = len(ids)
             for i in range(n):
@@ -101,8 +93,7 @@ class FuzzyMatcher:
                         continue
 
                     # Date window <= 7 days
-                    date_diff = abs((dates[j] - dates[i]) / np.timedelta64(1, "D"))
-                    if date_diff <= 7:
+                    if abs(dates[j] - dates[i]) <= 7:
                         total_candidates += 1
 
                         # Cross-ERP normalized ID match (e.g. SAP-2024-123456 vs SAP2024123456)
@@ -142,11 +133,7 @@ class FuzzyMatcher:
         matches_df = pd.DataFrame(confirmed_matches, columns=cols_out)
 
         # Build lookup dict of max fuzzy score mapped to the duplicate invoice (record_b_id)
-        fuzzy_scores: dict[int, float] = defaultdict(float)
-        for _, row in matches_df.iterrows():
-            s = row["similarity_score"]
-            dup_id = int(row["record_b_id"])
-            fuzzy_scores[dup_id] = max(fuzzy_scores[dup_id], s)
+        fuzzy_scores = matches_df.groupby("record_b_id")["similarity_score"].max().to_dict()
 
         rejected = total_candidates - len(confirmed_matches)
         cut_pct = (rejected / total_candidates * 100.0) if total_candidates > 0 else 0.0
@@ -154,4 +141,4 @@ class FuzzyMatcher:
                     f"{len(confirmed_matches):,} confirmed, {rejected:,} false matches rejected "
                     f"({cut_pct:.1f}% reduction in false-duplicate flags)")
 
-        return matches_df, dict(fuzzy_scores)
+        return matches_df, fuzzy_scores
