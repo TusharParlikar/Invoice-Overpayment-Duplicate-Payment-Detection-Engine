@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+from functools import cache
 import pandas as pd
 import logging
 
@@ -31,14 +32,8 @@ def standardize_dates(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_currency(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     rates = {'USD': 1.0, 'EUR': 1.08, 'GBP': 1.27}
-    
-    def convert_to_usd(row):
-        curr = row.get('currency', 'USD')
-        amt = row.get('amount', 0)
-        return amt * rates.get(curr, 1.0)
-        
     if 'currency' in df.columns and 'amount' in df.columns:
-        df['amount_usd'] = df.apply(convert_to_usd, axis=1)
+        df['amount_usd'] = df['amount'] * df['currency'].map(rates).fillna(1.0)
     return df
 
 def clean_invoice_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -47,7 +42,8 @@ def clean_invoice_data(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_currency(df)
     
     if 'vendor_name' in df.columns:
-        df['vendor_name_clean'] = df['vendor_name'].apply(normalize_vendor_name)
+        # Only ~15K distinct name variants across 100K+ rows: normalize each once
+        df['vendor_name_clean'] = df['vendor_name'].map(cache(normalize_vendor_name))
         
     df.fillna({'amount': 0, 'amount_usd': 0}, inplace=True)
     return df
