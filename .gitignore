@@ -1,0 +1,16 @@
+# Python Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite temporary files
+*.db-wal
+*.db-shm
+
+# Environment & IDE
+.vscode/
+.idea/
+.venv/
+env/
+venv/
+
