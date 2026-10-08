@@ -1,0 +1,4 @@
+Invoice Number,Vendor Name,Invoice Date,Amount,Currency,Vendor ID,PO Number
+INV-2024-0001,Acme Supplies Ltd,2024-01-15,1250.00,USD,V-1001,PO-5501
+INV-2024-0002,Acme Supplies Ltd,2024-02-14,1310.50,USD,V-1001,PO-5512
+7781,Globex Corporation,2024-02-20,860.00,EUR,V-1002,

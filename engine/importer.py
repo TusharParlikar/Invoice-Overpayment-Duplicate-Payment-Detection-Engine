@@ -1,24 +1,19 @@
 """
-Import invoice/payment history from CSV or Excel (typical ERP export) into the database.
-
-    python -m intake.importer exports/invoices_2024.xlsx [--dayfirst]
+Load a company's invoice/payment history from CSV or Excel (any ERP export).
 
 Column names are matched loosely ("Invoice No", "invoice_number", "Supplier", ...).
-Required: invoice_id, vendor_name, invoice_date, amount. Everything else is optional.
+Required: invoice number, vendor name, invoice date, amount. Everything else is optional.
+See templates/company_records_template.csv.
 """
-import argparse
-import os
 import re
-import sys
+import sqlite3
 from functools import cache
 
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config
-from database.db_manager import DatabaseManager
-from preprocessing.cleaner import normalize_vendor_name
+from engine import db
+from engine.scoring import normalize_vendor_name
 
 REQUIRED = ["invoice_id", "vendor_name", "invoice_date", "amount"]
 ALIASES = {
@@ -39,12 +34,8 @@ ALIASES = {
 }
 INVOICE_COLUMNS = ["invoice_id", "vendor_id", "vendor_name", "invoice_date", "due_date", "amount", "currency",
                    "department", "po_number", "payment_status", "erp_source", "is_anomaly", "anomaly_type", "source"]
-VENDOR_MATCH_CUTOFF = 90  # rapidfuzz ratio on normalized names to reuse an existing vendor_id
-MIN_CONTAINED_NAME = 15   # one name containing the other only counts for names this long ("acme" ⊂ "acme bakery" doesn't)
-
-
-def _norm_header(h) -> str:
-    return re.sub(r"[\s_\-.#:]+", " ", str(h).strip().lower()).strip()
+VENDOR_MATCH_CUTOFF = 90  # name similarity (0-100) needed to reuse an existing vendor_id
+MIN_CONTAINED_NAME = 15   # one name containing the other only counts for names this long ("acme" in "acme bakery" doesn't)
 
 
 def read_table(file) -> pd.DataFrame:
@@ -56,11 +47,11 @@ def read_table(file) -> pd.DataFrame:
 
 
 def normalize(raw: pd.DataFrame, dayfirst: bool = False) -> tuple[pd.DataFrame, list[str]]:
-    """Map columns to the invoice schema and coerce types. Returns (rows, problems)."""
+    """Map columns to the invoice schema and coerce types. Returns (valid rows, problems found)."""
     lookup = {alias: field for field, names in ALIASES.items() for alias in [field.replace("_", " "), *names]}
     rename = {}
     for col in raw.columns:
-        field = lookup.get(_norm_header(col))
+        field = lookup.get(re.sub(r"[\s_\-.#:]+", " ", str(col).strip().lower()).strip())
         if field and field not in rename.values():
             rename[col] = field
     df = raw.rename(columns=rename)[list(rename.values())].copy()
@@ -80,7 +71,7 @@ def normalize(raw: pd.DataFrame, dayfirst: bool = False) -> tuple[pd.DataFrame, 
 
     bad = df["amount"].isna() | df["invoice_date"].isna() | df["invoice_id"].isin(["", "nan"]) | df["vendor_name"].isin(["", "nan"])
     if bad.any():
-        problems.append(f"Skipped {int(bad.sum())} row(s) with a missing or unreadable invoice id, vendor, date or amount.")
+        problems.append(f"Skipped {int(bad.sum())} row(s) with a missing or unreadable invoice number, vendor, date or amount.")
     df = df[~bad].copy()
 
     df["currency"] = df["currency"].fillna("USD").astype(str).str.upper() if "currency" in df.columns else "USD"
@@ -90,12 +81,10 @@ def normalize(raw: pd.DataFrame, dayfirst: bool = False) -> tuple[pd.DataFrame, 
 
 
 def resolve_vendor_ids(names: pd.Series, vendors: pd.DataFrame) -> pd.Series:
-    """Map vendor names to known vendor_ids (exact or fuzzy on normalized name); new names get a slug id."""
-    clean = names.map(cache(normalize_vendor_name))
-    known = {}
-    if not vendors.empty:
-        known = dict(zip(vendors["vendor_name"].map(normalize_vendor_name), vendors["vendor_id"]))
+    """Map vendor names to known vendor_ids (exact or fuzzy on the normalized name); new names get a new id."""
+    known = dict(zip(vendors["vendor_name"].map(normalize_vendor_name), vendors["vendor_id"])) if not vendors.empty else {}
     choices = list(known)
+    long_names = [x for x in choices if len(x) >= MIN_CONTAINED_NAME]
 
     @cache
     def one(c: str) -> str:
@@ -104,48 +93,29 @@ def resolve_vendor_ids(names: pd.Series, vendors: pd.DataFrame) -> pd.Series:
         if choices:
             hit = process.extractOne(c, choices, scorer=fuzz.ratio, score_cutoff=VENDOR_MATCH_CUTOFF)
             if not hit and len(c) >= MIN_CONTAINED_NAME:  # truncated/extended: "home master hardware &" vs "... & tailoring"
-                long_names = [x for x in choices if len(x) >= MIN_CONTAINED_NAME]
                 hit = process.extractOne(c, long_names, scorer=fuzz.partial_ratio, score_cutoff=95)
             if hit:
                 return known[hit[0]]
         return "V-" + (re.sub(r"[^a-z0-9]+", "-", c).strip("-")[:40].upper() or "UNKNOWN")
 
-    return clean.map(one)
+    return names.map(normalize_vendor_name).map(one)
 
 
-def import_records(df: pd.DataFrame, db: DatabaseManager, source: str = "import") -> int:
+def import_records(conn: sqlite3.Connection, df: pd.DataFrame, source: str = "import") -> int:
     """Insert normalized rows (see normalize) and any new vendors. Returns rows inserted."""
     if df.empty:
         return 0
     df = df.copy()
     if "vendor_id" not in df.columns or df["vendor_id"].isna().any():
-        resolved = resolve_vendor_ids(df["vendor_name"], db.execute_query("SELECT vendor_id, vendor_name FROM vendors"))
+        resolved = resolve_vendor_ids(df["vendor_name"], db.query(conn, "SELECT vendor_id, vendor_name FROM vendors"))
         df["vendor_id"] = df["vendor_id"].fillna(resolved) if "vendor_id" in df.columns else resolved
     df["vendor_id"] = df["vendor_id"].astype(str)
     df["source"] = source
 
-    vendors = df.drop_duplicates("vendor_id")[["vendor_id", "vendor_name"]].copy()
-    vendors["vendor_name_normalized"] = vendors["vendor_name"].map(normalize_vendor_name)
-    vendors["erp_source"] = df.drop_duplicates("vendor_id")["erp_source"].values if "erp_source" in df.columns else None
-    db.bulk_insert_vendors(vendors)
-    db.bulk_insert_invoices(df.reindex(columns=INVOICE_COLUMNS))
+    first = df.drop_duplicates("vendor_id")
+    vendors = first[["vendor_id", "vendor_name"]].assign(
+        vendor_name_normalized=first["vendor_name"].map(normalize_vendor_name),
+        erp_source=first["erp_source"] if "erp_source" in df.columns else None)
+    db.add_vendors(conn, vendors)
+    db.append(conn, "invoices", df.reindex(columns=INVOICE_COLUMNS))
     return len(df)
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("file", help="CSV or Excel file of invoices")
-    ap.add_argument("--dayfirst", action="store_true", help="dates are dd/mm/yyyy (default mm/dd/yyyy for ambiguous dates)")
-    args = ap.parse_args()
-
-    df, problems = normalize(read_table(args.file), dayfirst=args.dayfirst)
-    for p in problems:
-        print("  !", p)
-    with DatabaseManager(config.DB_PATH) as db:
-        db.init_db()
-        n = import_records(df, db, source=os.path.basename(args.file))
-        print(f"Imported {n:,} invoices. Total records: {db.count_invoices():,}. Next: python pipeline.py")
-
-
-if __name__ == "__main__":
-    main()
