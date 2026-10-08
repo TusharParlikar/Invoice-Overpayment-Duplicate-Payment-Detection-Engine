@@ -87,7 +87,7 @@ def check(conn: sqlite3.Connection, new: pd.DataFrame, model: dict | None) -> tu
                        for r in rows.itertuples()]
     rows["verdict"] = rows["risk_category"].map(verdict)
     keep = INPUT_COLUMNS + ["id", "final_score", "risk_category", "verdict", "all_flags", "reasons",
-                            "rule_score", "ml_score", "amount_to_vendor_median"]
+                            "rule_score", "ml_score", "amount_to_vendor_median", "vendor_history_count"]
     return rows[keep].reset_index(drop=True), related
 
 

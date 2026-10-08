@@ -26,7 +26,7 @@ for a full audit.
 ## Scoring (`engine/scoring.py`)
 
 1. **Clean:** dates are parsed; amounts are converted to USD using the exchange-rate table (`data/exchange_rates.csv`, edited in the app; defaults
-   in `config.USD_RATES`); vendor names are normalized (`ACME Corp., LLC` → `acme`). A currency without a rate is compared as-is, and
+   in `config.USD_RATES`); vendor names are normalized: lower case, no punctuation, no bracketed registration numbers, no legal forms (`ACME Corp., LLC` → `acme`, `TRI SHAAS SDN BHD (728515-M)` → `tri shaas`). A currency without a rate is compared as-is, and
    the check's reasons say so.
 2. **Near-duplicate matching:** invoices are grouped by the first 3 letters of the normalized vendor name, then sorted by
    amount. Candidate pairs have amounts within 0.5% (+0.01) and dates within 7 days. A candidate pair is confirmed when:
@@ -40,11 +40,19 @@ for a full audit.
    amount and number). On the real receipts it removed one false positive.
 
    The later invoice is the duplicate. In a check, the new invoice is always the duplicate.
-3. **Features per vendor:** USD amount, z-score, amount ÷ median, amount ÷ max, invoices in the same calendar month
+3. **Features per vendor**, each against the vendor's *other* invoices: USD amount, robust z-score of the log amount, amount ÷ median,
+   amount ÷ max, invoices in the same calendar month
    (`vendor_invoices_same_month`), days since the previous invoice, invoices with the same amount (`vendor_same_amount_count`).
    Duplicate similarity is deliberately *not* a model feature: the near-duplicate rule already scores it, and adding it to
    the model would count the same evidence twice.
 4. **Rules:** see the table in the README. Each scores 0–1, and `rule_score` is the highest of them.
+
+   **Overpayment** compares an invoice with the vendor's *other* invoices (it needs at least 3 of them):
+   - **Leave-one-out:** an overpayment counted in its own baseline pulls the baseline toward itself. With the vendor's
+     plain mean and standard deviation, a vendor needed about 14 invoices before any amount could reach 3.5 standard deviations.
+   - **Log scale:** amounts vary by multiples. A supermarket bill of 5 or 500 is normal; a supplier that always bills about 1,000
+     sending 3,000 is not. The score is a robust z-score, (log amount − median log amount) ÷ (1.4826 × MAD), so 3× means more for a steady vendor.
+   - **Two tiers:** at least 3× the median and z ≥ 3.5 gives SUSPICIOUS. At least 2× and z ≥ 2.5 gives REVIEW.
 5. **Anomaly model:** see below. `ml_score` is 0–1.
 6. **Risk score:** `0.6 × rule_score + 0.4 × ml_score`. A rule hit ≥ 0.80 lifts it to at least 0.88. Scores ≥ 0.7 are
    **HIGH** (SUSPICIOUS) and ≥ 0.4 are **MEDIUM** (REVIEW). The model's maximum contribution is 0.4, so **the model alone can
@@ -65,37 +73,62 @@ for a full audit.
 
 ## Image-tamper model (`engine/tamper.py`)
 
-- **Features (17 per image):** error-level analysis (re-save as JPEG at quality 90, then diff) and a noise residual (image minus its
-  3×3 median), summarized per 32×32 block over text areas only (mean, std, median, p95, max, max/median, share of
-  outlier blocks), plus text-area share and global ELA/noise means.
 - **Data:** *Find it again!* has 988 real receipt scans, 163 of them forged, with official train/val/test splits (577/192/218).
-- **Training** (`python cli.py train-tamper`): logistic regression on train+val. The decision threshold is the best F1 on
-  5-fold **out-of-fold** predictions. The test split is used only for the final report.
+  **The edited regions are marked**, which is what the model learns from.
+- **Features, per 32×32 block with printed content (57 values):** error-level analysis at JPEG qualities 75, 90 and 95 (re-save, then diff),
+  a noise residual (image minus its 3×3 median), an edge map, and gray level. Each is summarized as mean, std and max, then taken raw,
+  relative to the whole receipt and relative to the 8 neighbouring blocks. A pasted digit stands out from the digits next to it.
+- **Model:** gradient-boosted trees (`HistGradientBoostingClassifier`, 300 iterations, ≥ 50 blocks per leaf, L2 1.0, balanced classes)
+  classify each block as edited or not. A receipt's score is its most suspicious block, and the app outlines that block for the reviewer.
+- **Training** (`python cli.py train-tamper`): train+val. The threshold is the best F1 on 5-fold **out-of-fold** predictions, with folds
+  split by receipt so blocks from one receipt never sit on both sides. The test split is used only for the final report.
 
-| | Train ROC-AUC | 5-fold CV ROC-AUC | Test ROC-AUC | Test precision | Test recall |
-|---|---|---|---|---|---|
-| Previous random forest (500 trees, leaf 2) | **0.999** | 0.761 ± 0.042 | 0.731 | 36.8% | 40.0% |
-| More regularized forest (depth 5, leaf 20) | 0.903 | 0.743 ± 0.062 | 0.728 | – | – |
-| **Logistic regression (shipped)** | 0.777 | 0.725 ± 0.047 | **0.770** | **39.0%** | **45.7%** |
+| Model | Train ROC-AUC | CV ROC-AUC | Test ROC-AUC | Test precision | Test recall | Test F1 |
+|---|---|---|---|---|---|---|
+| Random forest on 17 whole-image numbers (first version) | **0.999** | 0.761 | 0.731 | 36.8% | 40.0% | 0.384 |
+| Logistic regression on the same 17 numbers | 0.777 | 0.725 | 0.770 | 39.0% | 45.7% | 0.421 |
+| Logistic regression on blocks | 0.888 | 0.870 | 0.850 | 53.3% | 45.7% | 0.492 |
+| **Gradient boosting on blocks (shipped)** | 0.968 | 0.902 | **0.909** | **75.0%** | **68.6%** | **0.716** |
 
-**Overfitting.** The previous forest memorized its training set: it scored 0.999 there and 0.73 on unseen receipts. The logistic regression's CV score is within one
-standard error of the best, it does better on the test split, it shows almost no train/test gap, and it shrinks the model file from 4.5 MB to 2 KB. The limit is
-the feature set and the ~160 forged examples, not model capacity.
+**Overfitting.** The first forest memorized its 769 training receipts: 0.999 on them, 0.73 on unseen receipts. Labelling blocks instead of
+whole receipts gives 635,000 training examples, about 4,700 of them edited. The shipped model's cross-validated (0.902) and test (0.909) scores
+agree, so the remaining train/test gap (0.968) is ordinary.
+
+**Your answer key** (`data/samples/random_test`, 10 receipts from the test split): 9 of 10 correct, with 4 of 5 forgeries caught and no
+genuine receipt flagged. The missed forgery scores 0.961, just under the 0.978 threshold.
 
 **What else was tried.** An arithmetic check on the receipt text (CASH − CHANGE should equal TOTAL) was tested on the whole dataset.
-Only 37% of receipts can be checked that way. Among those, 31% of forged receipts fail it, but so do 11% of genuine ones (mostly OCR or parse noise), so its flags
-would be right about 35% of the time, no better than the image model. Most forgeries in this dataset keep the arithmetic consistent. A JPEG-grid
-feature also did not help. The next real step is more, and more varied, forged training data.
+Only 37% of receipts can be checked that way. Among those, 31% of forged receipts fail it, but so do 11% of genuine ones (mostly parse
+noise), so its flags would be right about 35% of the time, so it was not added. A JPEG-grid feature also did not help.
 
-**Safeguards.** A tamper flag gives REVIEW only. **PDFs are never tamper-scored:** rendering a page resamples it, which erases the
-traces the model reads and caused false flags in testing.
+**Limits.** All training receipts are Malaysian retail receipts scanned in one way. Other document types, phone photos and other
+editing tools are untested. **PDFs are never tamper-scored:** rendering a page resamples it, which erases the traces the model reads.
+A tamper flag gives REVIEW only.
 
 ## Evaluation honesty
 
 - An earlier version reported 98.6% precision on 105K **synthetic** invoices. That claim was removed for two reasons: the anomalies were generated
   alongside the rules that detect them, and the evaluation threshold was tuned on the same labels it was scored on. The audit now
   evaluates at the fixed HIGH threshold only.
-- Accuracy on real data needs labelled records: add an `is_anomaly` column (1 = known bad, plus an optional `anomaly_type`) to an
+- **Benchmark on real data** (`python tests/benchmark.py`): 10-fold cross-validation on the 377 real receipts, end to end (import,
+  audit, check). Negatives are held-out genuine receipts and the vendor's next bill. Positives are real records with real-world errors
+  applied. The error types come from how duplicates arise, not from the rule thresholds. Flagged = SUSPICIOUS or REVIEW.
+
+  | Case | Before | Now |
+  |---|---|---|
+  | Genuine receipt flagged (false positive) | 0.8% | 3.8% (2.1% SUSPICIOUS) |
+  | Vendor's next bill flagged | 0.0% | 0.8% |
+  | Exact copy / number retyped / OCR confusion / date shifted | 100% | 100% |
+  | Vendor name written differently | 76.7% | 99.2% |
+  | All errors combined | 75.0% | 99.2% |
+  | Overpayment 10× / 5× / 3× / 2× | 18% / 15% / 0% / 0% | 38% / 33% / 17% / 5% |
+  | Overpayment 10× / 5× / 3×, vendor has 10+ invoices | – | 49% / 44% / 18% |
+
+  The old near-zero false-positive rate came from an overpayment rule that almost never fired. Retail receipts vary enormously within
+  one shop, so overpayment recall on this data is a lower bound; steady supplier invoices make overpayments far easier to see.
+- **Your batch answer key** (`data/samples/random_test`, 20 rows): 18 of 20 correct (was 16). Both misses are overpayments of 3.7× and 7.9× at shops whose
+  own receipts already span about 10× and 90×.
+- Accuracy on your own data needs labelled records: add an `is_anomaly` column (1 = known bad, plus an optional `anomaly_type`) to an
   import, and `python cli.py audit` reports precision, recall and recall per type.
 
 ## Receipts (`engine/receipts.py`)
@@ -131,3 +164,4 @@ individual accounts or roles. Encryption is left to HTTPS settings and disk encr
 - **Tests:** `python tests/test_engine.py` (run by GitHub Actions on every push). It covers the field parser, column matching, the template, and
   an audit plus checks: an exact duplicate, a reformatted duplicate, an overpayment, a normal invoice, a new vendor, a sequential
   next invoice, a misspelled vendor, a currency without a rate, schema defaults and backups.
+  `python tests/benchmark.py [records.csv]` measures accuracy; re-run it after changing any threshold.

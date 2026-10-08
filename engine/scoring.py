@@ -21,16 +21,20 @@ from engine import config
 
 # ── Cleaning ───────────────────────────────────────────────────────────────
 
-_SUFFIXES = re.compile(r"\b(llc|inc|incorporated|corp|corporation|ltd|limited|co|company)\b")
+# Legal forms differ between systems for the same company ("Sdn. Bhd." vs "S/B", "Ltd" vs "Limited")
+_SUFFIXES = re.compile(r"\b(llc|inc|incorporated|corp|corporation|ltd|limited|co|company|sdn|bhd|berhad|s/b|sb|"
+                       r"pvt|private|plc|gmbh|llp|plt|pte|pty)\b")
 
 
 @cache
 def normalize_vendor_name(name) -> str:
-    """'ACME Corp., LLC' -> 'acme'."""
+    """'ACME Corp., LLC' -> 'acme'; 'TRI SHAAS SDN BHD (728515-M)' -> 'tri shaas'."""
     if not isinstance(name, str):
         return ""
     name = re.sub(r"[.,]", "", name.lower().strip())
-    return re.sub(r"\s+", " ", _SUFFIXES.sub("", name)).strip()
+    bare = re.sub(r"\(.*?\)", " ", name)  # registration numbers and "(M)" are not part of the name
+    out = re.sub(r"\s+", " ", _SUFFIXES.sub("", bare)).strip()
+    return out or re.sub(r"\s+", " ", name).strip()  # "(SEMENYIH) SDN BHD": keep something to compare
 
 
 def usd_rates() -> dict[str, float]:
@@ -118,17 +122,50 @@ def find_near_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 # ── Features (per vendor) ──────────────────────────────────────────────────
 
 # Duplicates are left to the rules; the model only sees how an amount and its timing compare with the vendor's history.
-FEATURES = ["amount_usd", "amount_zscore", "amount_to_vendor_median", "amount_to_vendor_max",
+FEATURES = ["amount_usd", "amount_robust_z", "amount_to_vendor_median", "amount_to_vendor_max",
             "vendor_invoices_same_month", "days_since_last_invoice", "vendor_same_amount_count"]
+LOO_MAX_GROUP = 500  # above this many invoices one invoice barely moves the vendor's median, so all are used
+
+
+def _others_stats(a: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """For each amount: median, MAD and max of the vendor's *other* amounts (NaN if there are none).
+
+    Leaving the invoice out matters: an overpayment included in its own baseline drags the baseline
+    toward itself, which hid every overpayment at vendors with fewer than ~14 invoices.
+    """
+    m = len(a)
+    if m == 1:
+        return np.full(1, np.nan), np.full(1, np.nan), np.full(1, np.nan)
+    if m > LOO_MAX_GROUP:
+        med = np.median(a)
+        return np.full(m, med), np.full(m, np.median(np.abs(a - med))), np.full(m, a.max())
+    others = np.broadcast_to(a, (m, m))[~np.eye(m, dtype=bool)].reshape(m, m - 1)
+    med = np.median(others, axis=1)
+    return med, np.median(np.abs(others - med[:, None]), axis=1), others.max(axis=1)
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    by_vendor = df.groupby("vendor_id")["amount_usd"]
-    safe = lambda s: s.replace(0, 1.0).fillna(1.0)
-    df["amount_zscore"] = (df["amount_usd"] - by_vendor.transform("mean")) / safe(by_vendor.transform("std"))
-    df["amount_to_vendor_median"] = df["amount_usd"] / safe(by_vendor.transform("median"))
-    df["amount_to_vendor_max"] = df["amount_usd"] / safe(by_vendor.transform("max"))
+    amount = df["amount_usd"].to_numpy(float)
+    med, mx, n = (np.full(len(df), np.nan) for _ in range(3))
+    for idx in df.groupby("vendor_id").indices.values():
+        med[idx], _, mx[idx] = _others_stats(amount[idx])
+        n[idx] = len(idx) - 1
+    df["vendor_history_count"] = n
+    df["vendor_median_others"] = med
+    df["amount_to_vendor_median"] = amount / np.where(med > 0, med, np.nan)
+    df["amount_to_vendor_max"] = amount / np.where(mx > 0, mx, np.nan)
+    # How unusual the amount is for this vendor, on a log scale: amounts vary by multiples (a supermarket bill of 5 or
+    # 500 is normal, a supplier billing 1,000 every month is not), so 3x means much more for a steady vendor. Robust
+    # z-score: median and MAD (x1.4826 = standard deviation for normal data) of the vendor's other invoices. A vendor
+    # that always bills the same amount has MAD 0; any other amount is then infinitely unusual, capped at 50.
+    log = np.log(np.maximum(amount, 0.01))
+    lmed, lmad = (np.full(len(df), np.nan) for _ in range(2))
+    for idx in df.groupby("vendor_id").indices.values():
+        lmed[idx], lmad[idx], _ = _others_stats(log[idx])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = (log - lmed) / (1.4826 * lmad)
+    df["amount_robust_z"] = np.clip(np.where((lmad == 0) & np.isclose(log, lmed), 0.0, z), -50, 50)
 
     ordered = df.sort_values(["vendor_id", "invoice_date"])
     gap = ordered["invoice_date"] - ordered.groupby("vendor_id")["invoice_date"].shift(1)
@@ -136,7 +173,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     month = df["invoice_date"].dt.to_period("M")
     df["vendor_invoices_same_month"] = df.groupby([df["vendor_id"], month])["invoice_id"].transform("count").astype(float)
     df["vendor_same_amount_count"] = df.groupby([df["vendor_id"], df["amount_usd"].round(1)])["invoice_id"].transform("count").astype(float)
-    df[FEATURES] = df[FEATURES].fillna(0.0)
+    df[FEATURES] = df[FEATURES].fillna({"amount_to_vendor_median": 1.0, "amount_to_vendor_max": 1.0}).fillna(0.0)
     return df
 
 
@@ -150,8 +187,12 @@ def apply_rules(df: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
     # A later copy of the same vendor + invoice number + amount (the first stays clean)
     rules["exact_dup"] = df.duplicated(["vendor_id", "invoice_id", "amount_usd"], keep="first").astype(float)
     rules["near_dup"] = df["id"].map(pairs.groupby("record_b_id")["similarity_score"].max()).fillna(0.0)
-    over = (ratio >= config.OVERPAYMENT_MULTIPLIER) & (df["amount_zscore"] >= config.OVERPAYMENT_MIN_ZSCORE)
-    rules["overpayment"] = np.where(over, np.maximum(0.85, (ratio - 1.0).clip(0.0, 5.0) / 5.0), 0.0)
+    judged = df["vendor_history_count"] >= config.OVERPAYMENT_MIN_HISTORY
+    z = df["amount_robust_z"]
+    over = judged & (ratio >= config.OVERPAYMENT_MULTIPLIER) & (z >= config.OVERPAYMENT_MIN_ZSCORE)
+    maybe_over = judged & (ratio >= config.OVERPAYMENT_REVIEW_MULTIPLIER) & (z >= config.OVERPAYMENT_REVIEW_ZSCORE)
+    # Strong evidence holds the payment (HIGH); moderate evidence asks for a review (0.7 x 60% rules weight = MEDIUM)
+    rules["overpayment"] = np.where(over, np.maximum(0.85, (ratio - 1.0).clip(0.0, 5.0) / 5.0), np.where(maybe_over, 0.7, 0.0))
     burst = df.groupby(["vendor_id", "po_number", "invoice_date"])["invoice_id"].transform("count")
     rules["rapid_fire"] = np.where(burst >= config.RAPID_FIRE_MIN_COUNT, 0.90, 0.0)
     round_amt = ((amount >= config.ROUND_NUMBER_MIN_AMOUNT) & (amount % config.ROUND_NUMBER_STEP == 0)

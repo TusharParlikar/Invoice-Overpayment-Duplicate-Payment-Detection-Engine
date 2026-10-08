@@ -90,27 +90,33 @@ Every check is logged in the *Recent checks* table.
 |---|---|---|
 | Exact duplicate | Same vendor, invoice number and amount as a record | SUSPICIOUS |
 | Near duplicate | Same invoice in a different format: number differs only by dashes/spaces or a typo, or vendor name spelled differently; amount within 0.5%, date within 7 days. The vendor's next invoice (sequential number, new date) is not a duplicate | SUSPICIOUS |
-| Overpayment | At least 3× the vendor's median invoice **and** 3.5 standard deviations above its mean | SUSPICIOUS |
+| Overpayment | At least 3× the median of the vendor's other invoices **and** far outside how much that vendor's amounts normally vary (needs 3+ past invoices) | SUSPICIOUS |
+| Possible overpayment | At least 2× the median and clearly outside the vendor's normal range | REVIEW |
 | Burst | 3+ invoices from one vendor on the same PO and date | SUSPICIOUS |
 | Large round amount | At least 25,000, a multiple of 5,000, and 2.5× the vendor's median | REVIEW |
 | Anomaly model | Unusual compared with your own payment history (Isolation Forest) | REVIEW at most |
-| Image tamper | Pixel statistics suggest a photo or scan was edited | REVIEW at most |
+| Image tamper | Pixel statistics suggest part of a photo or scan was edited; the app outlines the area | REVIEW at most |
 
 All thresholds are in [engine/config.py](engine/config.py). How each part works, the models, and how they were
 validated: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
 
 ## Results and limitations
 
-- **Real receipts:** with 377 genuine receipts loaded as history, the audit flags 5 as high risk: 4 are the same receipt
-  recorded twice, 1 is the same receipt entered with a reformatted number. Re-uploading a receipt already on record is
-  caught as an exact duplicate.
-- **Speed** (100,000 records, laptop CPU): checking 1 invoice takes 0.5 s, a batch of 50 takes 3.5 s, and a full audit takes 7.5 s.
-  OCR adds 7–15 s per photo.
-- **Rules:** no accuracy figure on real company data yet. If your records carry an `is_anomaly` column (1 = known
-  bad), the audit reports precision and recall on them.
-- **Image-tamper model:** weak. On held-out receipts it catches about 46% of edited images, and about 39% of its flags are
-  real edits. Genuine receipts are sometimes flagged, so a tamper flag only ever asks for a review. More forged training data
-  would help most; code changes alone won't fix it (see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)).
+Measured on real data (`python tests/benchmark.py`, 10-fold cross-validation on 377 real receipts):
+
+| | Result |
+|---|---|
+| Duplicates: exact copy, retyped number, OCR misread, date shifted, vendor name written differently | 99–100% caught |
+| Genuine receipts flagged | 3.8% (2.1% held as SUSPICIOUS, the rest REVIEW) |
+| Overpayment 10× / 5× / 3× | 38% / 33% / 17% caught |
+| Edited receipt images (held-out test set) | 69% caught; 75% of flags are real edits |
+
+- Overpayment recall is low on this data because retail shop receipts vary enormously (one shop's receipts range from 5 to 465).
+  With steady supplier invoices an unusual amount stands out far more. Accuracy on your own data: import a labelled sample with an
+  `is_anomaly` column and the audit reports precision and recall.
+- The tamper model was trained only on Malaysian retail receipts; other document types are untested. A tamper flag only asks for a
+  review, and the outlined area shows the reviewer what to compare.
+- **Speed** (100,000 records, laptop CPU): checking 1 invoice takes 0.5 s, and a full audit takes 7.5 s. OCR adds 7–15 s per photo, and the tamper check a few seconds.
 - Very different spellings of one vendor still count as a new vendor unless you give its vendor ID.
 
 ## Running it for a team
@@ -142,6 +148,7 @@ engine/
 templates/          company records template
 models/tamper.joblib  shipped image-tamper model (the anomaly model is trained per company and not committed)
 tests/test_engine.py  run by GitHub Actions on every push
+tests/benchmark.py    accuracy on real records (10-fold)
 ```
 
 ## Credits

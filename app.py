@@ -10,6 +10,7 @@ from datetime import date
 
 import pandas as pd
 import streamlit as st
+from PIL import ImageDraw
 
 from engine import checks, config, db, importer, receipts, scoring, tamper
 
@@ -114,18 +115,26 @@ with tab_one:
             v = checks.verdict(res.iloc[0].risk_category, bool(tamper_result and tamper_result[1]))
             checks.log_checks(conn, res, source=mode, file_name=file_key,
                               tamper_score=tamper_result[0] if tamper_result else None, verdicts=[v])
-            st.session_state.last_check = (res, related, tamper_result, v)
+            st.session_state.last_check = (res, related, tamper_result, v, image)
 
     if "last_check" in st.session_state:
-        res, related, tamper_result, v = st.session_state.last_check
+        res, related, tamper_result, v, checked_image = st.session_state.last_check
         r = res.iloc[0]
         st.divider()
         SHOW_VERDICT[v](f"**{v}**  ·  risk score {r.final_score:.2f} ({r.risk_category})")
         reasons = r.reasons.split("; ")
         if tamper_result and tamper_result[1]:
             reasons.append(f"The image may have been edited ({tamper_result[0]:.0%} tamper probability): "
-                           "compare it with the original document")
+                           "compare the outlined area with the original document")
         st.markdown("\n".join(f"- {x}" for x in reasons))
+        if tamper_result and tamper_result[1] and tamper_result[2]:
+            x, y, w, h = tamper_result[2]
+            pad = 3 * w  # show the block with its surroundings
+            outlined = checked_image.convert("RGB")
+            ImageDraw.Draw(outlined).rectangle([x - 4, y - 4, x + w + 4, y + h + 4], outline=(220, 30, 30), width=4)
+            crop = outlined.crop((max(0, x - pad), max(0, y - pad),
+                                  min(outlined.width, x + w + pad), min(outlined.height, y + h + pad)))
+            st.image([outlined, crop], caption=["Most suspicious area", "Close-up"], width=320)
         if not related.empty:
             st.markdown("**Matching records**")
             st.dataframe(related.drop(columns=["new_id"]), hide_index=True)
