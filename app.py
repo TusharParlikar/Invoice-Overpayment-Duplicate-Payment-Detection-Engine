@@ -3,7 +3,9 @@ Invoice checker web app.
 
     python -m streamlit run app.py
 """
+import hmac
 import os
+import threading
 from datetime import date
 
 import pandas as pd
@@ -12,7 +14,6 @@ import streamlit as st
 from engine import checks, config, db, importer, receipts, scoring, tamper
 
 st.set_page_config(page_title="Invoice Checker", page_icon="🧾", layout="wide")
-CURRENCIES = ["USD", "EUR", "GBP", "INR", "MYR", "Other"]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"]
 TABLE_TYPES = ["xlsx", "xls", "csv"]
 TEMPLATE = os.path.join(config.ROOT, "templates", "company_records_template.csv")
@@ -24,10 +25,29 @@ def _model(mtime: float):  # keyed on file time so a retrain reloads it
     return scoring.load_model()
 
 
+@st.cache_resource
+def _preload_ocr():
+    """Load the OCR engine (20-30 s) in the background at startup instead of on the first upload."""
+    threading.Thread(target=receipts.load_engine, daemon=True).start()
+
+
 def anomaly_model():
     path = config.ANOMALY_MODEL_PATH
     return _model(os.path.getmtime(path)) if os.path.exists(path) else None
 
+
+# Optional shared password: set INVOICE_APP_PASSWORD before starting the app
+PASSWORD = os.environ.get("INVOICE_APP_PASSWORD")
+if PASSWORD and not st.session_state.get("signed_in"):
+    entered = st.text_input("Password", type="password")
+    if entered and hmac.compare_digest(entered.encode(), PASSWORD.encode()):
+        st.session_state.signed_in = True
+        st.rerun()
+    if entered:
+        st.error("Wrong password.")
+    st.stop()
+
+_preload_ocr()
 
 # One connection per browser session: a sqlite3 connection must not be shared across sessions' threads
 if "conn" not in st.session_state:
@@ -75,15 +95,18 @@ with tab_one:
         parsed = pd.to_datetime(fields.get("invoice_date"), errors="coerce")
         inv_date = c1.date_input("Invoice date", parsed.date() if pd.notna(parsed) else date.today())
         amount = c2.number_input("Total amount", min_value=0.0, value=float(fields.get("amount") or 0.0), step=0.01, format="%.2f")
-        cur = fields.get("currency") or "USD"
-        currency = c1.selectbox("Currency", CURRENCIES, index=CURRENCIES.index(cur) if cur in CURRENCIES else 0)
+        currencies = sorted(scoring.usd_rates())  # the ones with an exchange rate (Company records > Exchange rates)
+        cur = fields.get("currency") if fields.get("currency") in currencies else "USD"
+        currency = c1.selectbox("Currency", currencies, index=currencies.index(cur))
+        vendor_id = c2.text_input("Vendor ID (optional)", help="Your system's vendor code. Use it when the name on the "
+                                  "document differs from the name in your records")
         submitted = st.form_submit_button("Check", type="primary")
 
     if submitted:
         if not vendor.strip() or not invoice_id.strip() or amount <= 0:
             st.error("Vendor, invoice number and a positive amount are required.")
         else:
-            new = pd.DataFrame([dict(invoice_id=invoice_id.strip(), vendor_name=vendor.strip(),
+            new = pd.DataFrame([dict(invoice_id=invoice_id.strip(), vendor_name=vendor.strip(), vendor_id=vendor_id.strip() or None,
                                      invoice_date=inv_date.isoformat(), amount=amount, currency=currency)])
             with st.spinner("Checking against company records..."):
                 res, related = checks.check(conn, new, anomaly_model())
@@ -164,6 +187,8 @@ with tab_records:
             st.caption(f"{len(rows):,} rows ready. Recognized columns: {', '.join(rows.columns)}")
             st.dataframe(rows.head(20), hide_index=True)
             if st.button(f"Import {len(rows):,} records", type="primary"):
+                if n_records:
+                    db.backup(conn)
                 n = importer.import_records(conn, rows, source=up.name)
                 st.success(f"Imported {n:,} records. Now run step 2.")
 
@@ -175,6 +200,18 @@ with tab_records:
             s = checks.audit(conn)
         st.success(f"Audited {s['records']:,} records: {s.get('HIGH', 0):,} high risk, {s.get('MEDIUM', 0):,} medium."
                    + ("" if s["model_trained"] else f" Anomaly model skipped: needs {config.MIN_RECORDS_FOR_MODEL}+ records."))
+
+    with st.expander("Exchange rates"):
+        st.caption("USD per one unit of each currency, used to compare amounts across currencies. Rates are applied to "
+                   "new checks immediately and to stored results at the next audit.")
+        rates = pd.DataFrame(sorted(scoring.usd_rates().items()), columns=["currency", "usd_per_unit"])
+        edited = st.data_editor(rates, num_rows="dynamic", hide_index=True, key="rates")
+        if st.button("Save rates"):
+            edited = edited.dropna()
+            edited["currency"] = edited["currency"].astype(str).str.upper().str.strip()
+            os.makedirs(os.path.dirname(config.EXCHANGE_RATES_PATH), exist_ok=True)
+            edited[edited["usd_per_unit"] > 0].to_csv(config.EXCHANGE_RATES_PATH, index=False)
+            st.success("Saved.")
 
     st.subheader("Highest-risk records (last audit)")
     st.dataframe(db.query(conn, """

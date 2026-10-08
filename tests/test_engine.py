@@ -63,6 +63,25 @@ def test_audit_and_check():
         assert v["INV-9002"] == "OK", res
         assert "New vendor" in res.loc[res["invoice_id"] == "X-1", "reasons"].item(), res
         assert set(related["new_id"]) == {-1, -2}, related
+
+        # The vendor's next invoice (sequential number, same amount, a week later) is not a duplicate
+        nxt = pd.DataFrame([dict(invoice_id="INV-0060", vendor_name="Acme Supplies Ltd", invoice_date=str(
+            pd.Timestamp(str(days[-1])) + pd.Timedelta(days=7))[:10], amount=1000.0)])
+        assert checks.check(conn, nxt, model=None)[0]["verdict"].item() == "OK"
+
+        # Schema defaults apply to columns the file doesn't have
+        assert db.query(conn, "SELECT DISTINCT payment_status FROM invoices")["payment_status"].tolist() == ["pending"]
+
+        # A misspelled vendor gets a suggestion; a currency without a rate is called out
+        odd = pd.DataFrame([dict(invoice_id="Z-1", vendor_name="Acme Supply House", invoice_date="2025-03-17",
+                                 amount=50.0, currency="XYZ")])
+        reasons = checks.check(conn, odd, model=None)[0]["reasons"].item()
+        assert "Did you mean 'Acme Supplies Ltd'" in reasons and "No exchange rate for XYZ" in reasons, reasons
+
+        path = db.backup(conn, folder=os.path.join(tmp, "backups"))
+        with db.connect(path) as copy:
+            assert db.count_invoices(copy) == 60
+        copy.close()
         conn.close()
 
 

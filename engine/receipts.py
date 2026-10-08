@@ -6,6 +6,7 @@ to OCR for scanned PDFs. Field parsing is heuristic: it pre-fills a form the use
 """
 import io
 import re
+import threading
 from functools import cache
 
 import numpy as np
@@ -15,15 +16,23 @@ from PIL import Image
 PDF_MIN_TEXT_CHARS = 20  # below this a PDF page set is treated as a scan and OCR'd
 
 
+_engine_lock = threading.Lock()
+
+
 @cache
-def _engine():
-    from rapidocr import RapidOCR  # slow import + model load: once per process
+def _load():
+    from rapidocr import RapidOCR  # slow import + model load (20-30 s): once per process
     return RapidOCR()
+
+
+def load_engine():
+    with _engine_lock:  # the app preloads it in a background thread; an early upload waits instead of loading twice
+        return _load()
 
 
 def ocr_image(img: Image.Image) -> str:
     """OCR an image, re-assembling detected text boxes into reading-order lines."""
-    result = _engine()(np.asarray(img.convert("RGB"))[:, :, ::-1])  # RapidOCR expects BGR like OpenCV
+    result = load_engine()(np.asarray(img.convert("RGB"))[:, :, ::-1])  # RapidOCR expects BGR like OpenCV
     if result.boxes is None:
         return ""
     # Boxes come per text fragment; "TOTAL" and "12.50" on one printed line are often separate.

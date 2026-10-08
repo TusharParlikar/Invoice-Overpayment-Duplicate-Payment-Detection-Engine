@@ -1,6 +1,7 @@
 """SQLite storage: company invoice records, the last audit's results, and a log of every check."""
 import os
 import sqlite3
+from datetime import datetime
 
 import pandas as pd
 
@@ -66,6 +67,11 @@ CREATE TABLE IF NOT EXISTS receipt_checks (
     verdict TEXT
 );
 
+-- Left behind by older versions
+DROP TABLE IF EXISTS fuzzy_match_pairs;
+DROP INDEX IF EXISTS idx_invoices_invoice_date;
+DROP INDEX IF EXISTS idx_invoices_amount;
+
 CREATE INDEX IF NOT EXISTS idx_invoices_vendor_id ON invoices(vendor_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_vendor_name ON invoices(vendor_name);
 CREATE INDEX IF NOT EXISTS idx_invoices_invoice_id ON invoices(invoice_id);
@@ -104,6 +110,18 @@ def add_vendors(conn: sqlite3.Connection, vendors: pd.DataFrame):
     with conn:
         conn.executemany(f"INSERT OR IGNORE INTO vendors ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
                          vendors.itertuples(index=False, name=None))
+
+
+def backup(conn: sqlite3.Connection, folder: str = config.BACKUP_DIR, keep: int = 30) -> str:
+    """Consistent copy of the live database (safe while the app runs). Keeps the newest `keep` backups."""
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"invoices-{datetime.now():%Y%m%d-%H%M%S}.db")
+    with sqlite3.connect(path) as dest:
+        conn.backup(dest)
+    dest.close()
+    for old in sorted(f for f in os.listdir(folder) if f.startswith("invoices-"))[:-keep]:
+        os.remove(os.path.join(folder, old))
+    return path
 
 
 def replace_results(conn: sqlite3.Connection, results: pd.DataFrame):

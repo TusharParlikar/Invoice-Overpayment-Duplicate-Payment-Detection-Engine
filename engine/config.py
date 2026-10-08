@@ -9,8 +9,14 @@ DB_PATH = os.environ.get("INVOICE_DB_PATH", os.path.join(ROOT, "data", "invoices
 ANOMALY_MODEL_PATH = os.path.join(ROOT, "models", "anomaly.joblib")
 TAMPER_MODEL_PATH = os.path.join(ROOT, "models", "tamper.joblib")
 
-# Currency conversion to USD before comparing amounts. Unlisted currencies are compared as-is.
-USD_RATES = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27}
+BACKUP_DIR = os.path.join(ROOT, "data", "backups")
+
+# USD per unit of each currency, used to compare amounts across currencies. These defaults are
+# approximate; set your own in the app (Company records > Exchange rates), saved to EXCHANGE_RATES_PATH.
+# A currency without a rate is compared as-is and the check says so.
+EXCHANGE_RATES_PATH = os.path.join(ROOT, "data", "exchange_rates.csv")
+USD_RATES = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "INR": 0.012, "MYR": 0.22, "CAD": 0.73, "AUD": 0.66,
+             "JPY": 0.0067, "CNY": 0.14, "SGD": 0.74, "AED": 0.27, "CHF": 1.12}
 
 # Near-duplicate matching
 BLOCKING_KEY_LENGTH = 3               # only compare invoices whose cleaned vendor names share this many leading chars

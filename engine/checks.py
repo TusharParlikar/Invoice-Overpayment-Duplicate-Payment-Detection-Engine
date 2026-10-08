@@ -7,10 +7,12 @@ The two things the engine does with the scoring in engine/scoring.py:
 import sqlite3
 
 import pandas as pd
+from rapidfuzz import fuzz, process
 
 from engine import config, db
 from engine.importer import import_records, resolve_vendor_ids
-from engine.scoring import blend, normalize_vendor_name, save_model, score_model, score_rules, train_model
+from engine.scoring import (blend, normalize_vendor_name, save_model, score_model, score_rules, train_model,
+                            usd_rates)
 
 INPUT_COLUMNS = ["invoice_id", "vendor_name", "invoice_date", "amount", "currency", "vendor_id", "po_number"]
 
@@ -21,9 +23,9 @@ def audit(conn: sqlite3.Connection, model_path: str = config.ANOMALY_MODEL_PATH)
     if records.empty:
         return {"records": 0}
     df, pairs, candidates = score_rules(records)
-    model = train_model(df)
+    model, df = train_model(df)
     save_model(model, model_path)
-    df = blend(score_model(model, df))
+    df = blend(df)
 
     db.replace_results(conn, df[["id", "rule_score", "ml_score", "final_score", "risk_category", "all_flags"]]
                        .rename(columns={"id": "invoice_row_id", "all_flags": "flags"}))
@@ -67,10 +69,10 @@ def check(conn: sqlite3.Connection, new: pd.DataFrame, model: dict | None) -> tu
     """
     new = new.reindex(columns=INPUT_COLUMNS).reset_index(drop=True)
     new["id"] = -(new.index + 1)  # temporary ids; stored records are >= 1
-    new["currency"] = new["currency"].fillna("USD")
+    new["currency"] = new["currency"].fillna("USD").astype(str).str.upper()
+    vendors = db.query(conn, "SELECT vendor_id, vendor_name FROM vendors")
     if new["vendor_id"].isna().any():
-        new["vendor_id"] = new["vendor_id"].fillna(
-            resolve_vendor_ids(new["vendor_name"], db.query(conn, "SELECT vendor_id, vendor_name FROM vendors")))
+        new["vendor_id"] = new["vendor_id"].fillna(resolve_vendor_ids(new["vendor_name"], vendors))
     history = _relevant_history(conn, new)
 
     df, pairs, _ = score_rules(pd.concat([history, new], ignore_index=True), new_ids=set(new["id"]))
@@ -78,8 +80,10 @@ def check(conn: sqlite3.Connection, new: pd.DataFrame, model: dict | None) -> tu
     rows = blend(score_model(model, rows))
 
     related = _related_records(rows, pairs, df)
-    known_vendors = set(history["vendor_id"])
-    rows["reasons"] = [_reasons(r, related[related["new_id"] == r.id], r.vendor_id in known_vendors)
+    known_vendors, rates = set(history["vendor_id"]), usd_rates()
+    rows["reasons"] = [_reasons(r, related[related["new_id"] == r.id],
+                                None if r.vendor_id in known_vendors else _closest_vendor(r.vendor_name, vendors),
+                                r.currency in rates)
                        for r in rows.itertuples()]
     rows["verdict"] = rows["risk_category"].map(verdict)
     keep = INPUT_COLUMNS + ["id", "final_score", "risk_category", "verdict", "all_flags", "reasons",
@@ -118,7 +122,15 @@ def _related_records(rows: pd.DataFrame, pairs: pd.DataFrame, df: pd.DataFrame) 
     return related.merge(details, on="record_id", how="left")
 
 
-def _reasons(r, related: pd.DataFrame, known_vendor: bool) -> str:
+def _closest_vendor(name: str, vendors: pd.DataFrame) -> str:
+    """Best guess at which known vendor a new name means ("" if nothing is close), so the user can fix the name."""
+    names = dict(zip(vendors["vendor_name"].map(normalize_vendor_name), vendors["vendor_name"]))
+    hit = process.extractOne(normalize_vendor_name(name), list(names), scorer=fuzz.WRatio, score_cutoff=70)
+    return names[hit[0]] if hit else ""
+
+
+def _reasons(r, related: pd.DataFrame, closest_vendor: str | None, has_rate: bool) -> str:
+    """closest_vendor: None for a known vendor, else the nearest known name ("" if none)."""
     flags = str(r.all_flags).split(",")
     out = []
     for m in related.itertuples():
@@ -133,8 +145,11 @@ def _reasons(r, related: pd.DataFrame, known_vendor: bool) -> str:
         out.append("Large round-number amount, well above this vendor's usual")
     if "ml_isolation_forest" in flags:
         out.append(f"Among the most unusual {config.ISOLATION_FOREST_CONTAMINATION:.0%} of past payments (anomaly model)")
-    if not known_vendor:
-        out.append("New vendor: no payment history to compare against")
+    if closest_vendor is not None:
+        out.append("New vendor: no payment history to compare against"
+                   + (f". Did you mean '{closest_vendor}'? Correct the name or set its vendor ID to compare" if closest_vendor else ""))
+    if not has_rate:
+        out.append(f"No exchange rate for {r.currency}: amount compared as if it were USD (add one under Exchange rates)")
     return "; ".join(out) or "No issues found against existing records"
 
 

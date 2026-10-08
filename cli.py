@@ -4,6 +4,7 @@ Command line for the invoice checker. Everything here is also available in the w
     python cli.py import invoices.xlsx [--dayfirst]   load company records (CSV/Excel)
     python cli.py audit                               score all records + train the anomaly model
     python cli.py check new_invoices.xlsx [--out results.csv]   check invoices before paying them
+    python cli.py backup                              copy the database to data/backups/ (keeps the last 30)
     python cli.py demo                                load ~380 real receipts as sample records (downloads 670 MB once)
     python cli.py train-tamper                        retrain the image-tamper model (downloads 670 MB once)
 """
@@ -29,6 +30,7 @@ def main():
         p.add_argument("--dayfirst", action="store_true", help="dates are dd/mm/yyyy (default: mm/dd/yyyy when ambiguous)")
     sub.choices["check"].add_argument("--out", default="check_results.csv", help="where to write results")
     sub.add_parser("audit")
+    sub.add_parser("backup")
     sub.add_parser("demo")
     sub.add_parser("train-tamper")
     args = ap.parse_args()
@@ -45,6 +47,8 @@ def main():
     elif args.command == "demo":
         n = importer.import_records(conn, tamper.demo_history(), source="demo")
         print(f"Imported {n:,} demo receipts. Next: python cli.py audit")
+    elif args.command == "backup":
+        print("Backed up to", db.backup(conn))
     elif args.command == "audit":
         summary = checks.audit(conn)
         if not summary["records"]:

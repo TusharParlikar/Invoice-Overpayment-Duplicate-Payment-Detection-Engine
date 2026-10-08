@@ -15,8 +15,10 @@ env/
 venv/
 
 
-# Company records database (real invoice data: never commit)
+# Company data: records database, backups, exchange rates (never commit)
 *.db
+data/backups/
+data/exchange_rates.csv
 
 # Downloaded datasets and local test samples (dataset-derived images, answer keys)
 data/raw/

@@ -33,12 +33,22 @@ def normalize_vendor_name(name) -> str:
     return re.sub(r"\s+", " ", _SUFFIXES.sub("", name)).strip()
 
 
+def usd_rates() -> dict[str, float]:
+    """USD per unit of each currency: the editable exchange-rate table if present, else config defaults."""
+    try:
+        t = pd.read_csv(config.EXCHANGE_RATES_PATH)
+    except FileNotFoundError:
+        return dict(config.USD_RATES)
+    return {**config.USD_RATES, **dict(zip(t["currency"].str.upper().str.strip(), t["usd_per_unit"].astype(float)))}
+
+
 def clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
     if "due_date" in df.columns:
         df["due_date"] = pd.to_datetime(df["due_date"])
-    df["amount_usd"] = df["amount"] * df["currency"].map(config.USD_RATES).fillna(1.0)
+    # A currency without a rate is compared as-is; checks say so in the reasons
+    df["amount_usd"] = df["amount"] * df["currency"].map(usd_rates()).fillna(1.0)
     df["vendor_name_clean"] = df["vendor_name"].map(normalize_vendor_name)
     return df.fillna({"amount": 0, "amount_usd": 0})
 
@@ -55,13 +65,15 @@ def find_near_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     NEAR_DUP_DATE_WINDOW_DAYS. A candidate is confirmed when, for the same vendor, the invoice numbers
     match after removing dashes/spaces or are >= INVOICE_ID_MATCH_THRESHOLD similar; or when the vendor
     names are >= FUZZY_THRESHOLD similar (VENDOR_NAME_STRICT_THRESHOLD across vendor IDs) and the
-    numbers >= INVOICE_ID_SUPPORT_THRESHOLD. record_b is the later (duplicate) invoice.
+    numbers >= INVOICE_ID_SUPPORT_THRESHOLD. Numbers that differ only in their digits must also share the
+    date (sequential invoices are not duplicates). record_b is the later (duplicate) invoice.
     Exact copies are left to the exact-duplicate rule. Returns (pairs, number of candidates checked).
     """
     w = df[["id", "invoice_id", "vendor_id", "vendor_name_clean", "invoice_date", "amount_usd"]].copy()
     w["day"] = pd.to_datetime(w["invoice_date"]).values.astype("datetime64[D]").astype(np.int64)
     w["block"] = w["vendor_name_clean"].astype(str).str.lower().str.strip().str[:config.BLOCKING_KEY_LENGTH]
     w["clean_id"] = w["invoice_id"].astype(str).str.replace("-", "").str.replace(" ", "").str.upper()
+    w["id_shape"] = w["clean_id"].str.replace(r"\d", "#", regex=True)  # INV0501 -> INV####
 
     pairs, candidates = [], 0
     for block, g in w.groupby("block"):
@@ -69,8 +81,8 @@ def find_near_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             continue
         g = g.sort_values("amount_usd")
         # Plain lists: scalar access on numpy arrays is several times slower in this loop
-        ids, raw_ids, clean_ids, amts, days, names, vids = (
-            g[c].tolist() for c in ["id", "invoice_id", "clean_id", "amount_usd", "day", "vendor_name_clean", "vendor_id"])
+        ids, raw_ids, clean_ids, shapes, amts, days, names, vids = (g[c].tolist() for c in
+            ["id", "invoice_id", "clean_id", "id_shape", "amount_usd", "day", "vendor_name_clean", "vendor_id"])
         for i in range(len(ids)):
             max_amt = amts[i] * (1 + config.NEAR_DUP_AMOUNT_TOLERANCE) + 0.01
             j = i + 1
@@ -81,6 +93,11 @@ def find_near_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
                 candidates += 1
                 same_vendor = vids[i] == vids[j]
                 same_id = same_vendor and clean_ids[i] == clean_ids[j]           # SAP-2024-1 vs SAP20241
+                # Numbers that differ only in digits on different dates are the vendor's next invoice (INV-0501,
+                # INV-0502 a week later, e.g. a recurring bill), not a retyped copy: a typo keeps the document's date
+                if not same_id and shapes[i] == shapes[j] and days[i] != days[j]:
+                    j += 1
+                    continue
                 id_sim = fuzz.ratio(clean_ids[i], clean_ids[j]) / 100.0
                 similar_id = same_vendor and id_sim >= config.INVOICE_ID_MATCH_THRESHOLD
                 lev = fuzz.ratio(str(names[i]), str(names[j])) / 100.0 if names[i] and names[j] else 0.0
@@ -100,11 +117,12 @@ def find_near_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 # ── Features (per vendor) ──────────────────────────────────────────────────
 
+# Duplicates are left to the rules; the model only sees how an amount and its timing compare with the vendor's history.
 FEATURES = ["amount_usd", "amount_zscore", "amount_to_vendor_median", "amount_to_vendor_max",
-            "vendor_invoice_count_30d", "days_since_last_invoice", "same_amount_count_30d", "max_fuzzy_score"]
+            "vendor_invoices_same_month", "days_since_last_invoice", "vendor_same_amount_count"]
 
 
-def add_features(df: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     by_vendor = df.groupby("vendor_id")["amount_usd"]
     safe = lambda s: s.replace(0, 1.0).fillna(1.0)
@@ -115,11 +133,9 @@ def add_features(df: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
     ordered = df.sort_values(["vendor_id", "invoice_date"])
     gap = ordered["invoice_date"] - ordered.groupby("vendor_id")["invoice_date"].shift(1)
     df["days_since_last_invoice"] = gap.dt.days.fillna(999.0)
-    # Invoices from the vendor in the same calendar month / with the same amount (to 0.1) overall
     month = df["invoice_date"].dt.to_period("M")
-    df["vendor_invoice_count_30d"] = df.groupby([df["vendor_id"], month])["invoice_id"].transform("count").astype(float)
-    df["same_amount_count_30d"] = df.groupby([df["vendor_id"], df["amount_usd"].round(1)])["invoice_id"].transform("count").astype(float)
-    df["max_fuzzy_score"] = df["id"].map(pairs.groupby("record_b_id")["similarity_score"].max()).fillna(0.0).astype(float)
+    df["vendor_invoices_same_month"] = df.groupby([df["vendor_id"], month])["invoice_id"].transform("count").astype(float)
+    df["vendor_same_amount_count"] = df.groupby([df["vendor_id"], df["amount_usd"].round(1)])["invoice_id"].transform("count").astype(float)
     df[FEATURES] = df[FEATURES].fillna(0.0)
     return df
 
@@ -150,10 +166,10 @@ def apply_rules(df: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
 
 # ── Anomaly model (Isolation Forest on the company's own history) ──────────
 
-def train_model(df: pd.DataFrame) -> dict | None:
-    """Fit on the history. None when there is too little history to learn what normal looks like."""
+def train_model(df: pd.DataFrame) -> tuple[dict | None, pd.DataFrame]:
+    """Fit on the history and score it. Model is None when there is too little history to learn what normal looks like."""
     if len(df) < config.MIN_RECORDS_FOR_MODEL:
-        return None
+        return None, score_model(None, df)
     scaler = StandardScaler()
     X = scaler.fit_transform(df[FEATURES])
     forest = IsolationForest(n_estimators=config.ISOLATION_FOREST_N_ESTIMATORS,
@@ -161,19 +177,23 @@ def train_model(df: pd.DataFrame) -> dict | None:
     samples = forest.score_samples(X)
     offset = np.percentile(samples, 100.0 * config.ISOLATION_FOREST_CONTAMINATION)  # the "unusual" cutoff
     raw = samples - offset
-    return {"scaler": scaler, "forest": forest, "offset": offset, "raw_min": raw.min(), "raw_max": raw.max()}
+    model = {"features": FEATURES, "scaler": scaler, "forest": forest, "offset": offset,
+             "raw_min": raw.min(), "raw_max": raw.max()}
+    return model, _with_scores(model, df, raw)
 
 
 def score_model(model: dict | None, df: pd.DataFrame) -> pd.DataFrame:
     """ml_score 0-1 (higher = more unusual, relative to the training range); ml_prediction -1 = unusual."""
-    df = df.copy()
     if model is None:
         return df.assign(ml_score=0.0, ml_prediction=1)
     raw = model["forest"].score_samples(model["scaler"].transform(df[FEATURES])) - model["offset"]
+    return _with_scores(model, df, raw)
+
+
+def _with_scores(model: dict, df: pd.DataFrame, raw: np.ndarray) -> pd.DataFrame:
     span = model["raw_max"] - model["raw_min"]
-    df["ml_score"] = np.clip(1.0 - (raw - model["raw_min"]) / span, 0.0, 1.0) if span > 0 else 0.0
-    df["ml_prediction"] = np.where(raw < 0, -1, 1)
-    return df
+    return df.assign(ml_score=np.clip(1.0 - (raw - model["raw_min"]) / span, 0.0, 1.0) if span > 0 else 0.0,
+                     ml_prediction=np.where(raw < 0, -1, 1))
 
 
 def save_model(model: dict | None, path: str = config.ANOMALY_MODEL_PATH):
@@ -186,12 +206,12 @@ def save_model(model: dict | None, path: str = config.ANOMALY_MODEL_PATH):
 
 
 def load_model(path: str = config.ANOMALY_MODEL_PATH) -> dict | None:
-    """None if never trained, or saved by an older version (re-run the audit)."""
+    """None if never trained, or trained by an older version on different features (re-run the audit)."""
     try:
         model = joblib.load(path)
     except Exception:
         return None
-    return model if isinstance(model, dict) else None
+    return model if isinstance(model, dict) and model.get("features") == FEATURES else None
 
 
 # ── Risk score ─────────────────────────────────────────────────────────────
@@ -220,4 +240,4 @@ def score_rules(df: pd.DataFrame, new_ids=frozenset()) -> tuple[pd.DataFrame, pd
     flip = pairs["record_a_id"].isin(new_ids) & ~pairs["record_b_id"].isin(new_ids)
     # copy=True: a view would be overwritten mid-swap, leaving both ids equal
     pairs.loc[flip, ["record_a_id", "record_b_id"]] = pairs.loc[flip, ["record_b_id", "record_a_id"]].to_numpy(copy=True)
-    return apply_rules(add_features(df, pairs), pairs), pairs, candidates
+    return apply_rules(add_features(df), pairs), pairs, candidates

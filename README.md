@@ -38,7 +38,7 @@ QuickBooks, Xero, Tally, or a spreadsheet). One row per invoice:
 | Vendor Name | **yes** | `Acme Supplies Ltd` | Vendor, Supplier, Supplier Name, Payee, Merchant |
 | Invoice Date | **yes** | `2024-01-15` | Date, Document Date, Posting Date, Bill Date |
 | Amount | **yes** | `1250.00` | Total, Invoice Amount, Gross Amount, Amount Paid |
-| Currency | no (default USD) | `USD` | Curr, CCY |
+| Currency | no (default USD) | `USD`, `EUR`, `INR` | Curr, CCY |
 | Vendor ID | no, but recommended | `V-1001` | Vendor Code, Supplier ID, Supplier Code |
 | PO Number | no | `PO-5501` | PO, Purchase Order |
 
@@ -50,7 +50,11 @@ in [templates/company_records_template.csv](templates/company_records_template.c
 **Import**. If your dates are written day-first (`15/01/2024`), tick *Dates are day-first*. You can import several
 files (one per year or per ERP); each import adds to the records.
 
-**Step 3: Audit.** Click **Audit records & train model**. This scans all records for duplicates already paid
+**Step 3: Check the exchange rates** (only if you pay in more than one currency). Amounts are converted to USD before
+they are compared. The app ships approximate rates for 12 common currencies; set your own under **Company records →
+Exchange rates**. A check tells you when an invoice's currency has no rate.
+
+**Step 4: Audit.** Click **Audit records & train model**. This scans all records for duplicates already paid
 (listed under *Highest-risk records*) and trains the anomaly model on your history. Re-run it after each import.
 
 Same steps from the command line:
@@ -68,8 +72,9 @@ research dataset once).
 In the app:
 
 - **Check one invoice:** upload a photo, scan or PDF (the fields are read automatically, and you correct anything
-  misread) or type the fields in, then click **Check**. Once the invoice is paid, click **Add to company records** so a
-  later copy of it is caught.
+  misread) or type the fields in, then click **Check**. If the vendor's name on the document differs from your records,
+  the result suggests the closest known vendor; fix the name or enter its **Vendor ID**. Once the invoice is paid,
+  click **Add to company records** so a later copy of it is caught.
 - **Check a batch:** upload the invoices due for payment (same columns as above). You get a verdict per invoice and a
   CSV download.
 
@@ -84,7 +89,7 @@ Every check is logged in the *Recent checks* table.
 | Check | Fires when | Verdict |
 |---|---|---|
 | Exact duplicate | Same vendor, invoice number and amount as a record | SUSPICIOUS |
-| Near duplicate | Same invoice in a different format: number differs only by dashes/spaces or a typo, or vendor name spelled differently; amount within 0.5%, date within 7 days | SUSPICIOUS |
+| Near duplicate | Same invoice in a different format: number differs only by dashes/spaces or a typo, or vendor name spelled differently; amount within 0.5%, date within 7 days. The vendor's next invoice (sequential number, new date) is not a duplicate | SUSPICIOUS |
 | Overpayment | At least 3× the vendor's median invoice **and** 3.5 standard deviations above its mean | SUSPICIOUS |
 | Burst | 3+ invoices from one vendor on the same PO and date | SUSPICIOUS |
 | Large round amount | At least 25,000, a multiple of 5,000, and 2.5× the vendor's median | REVIEW |
@@ -96,23 +101,36 @@ validated: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
 
 ## Results and limitations
 
-- **Real receipts:** with 377 genuine receipts loaded as history, the audit flags 6 as high risk; 4 of them are the
-  same receipt recorded twice. Re-uploading a receipt already on record is caught as an exact duplicate.
+- **Real receipts:** with 377 genuine receipts loaded as history, the audit flags 5 as high risk: 4 are the same receipt
+  recorded twice, 1 is the same receipt entered with a reformatted number. Re-uploading a receipt already on record is
+  caught as an exact duplicate.
+- **Speed** (100,000 records, laptop CPU): checking 1 invoice takes 0.5 s, a batch of 50 takes 3.5 s, and a full audit takes 7.5 s.
+  OCR adds 7–15 s per photo.
 - **Rules:** no accuracy figure on real company data yet. If your records carry an `is_anomaly` column (1 = known
   bad), the audit reports precision and recall on them.
 - **Image-tamper model:** weak. On held-out receipts it catches about 46% of edited images, and about 39% of its flags are
-  real edits. That is why it can only ever ask for a review, and genuine receipts are sometimes flagged.
-- **No login.** Run it on a machine inside your company network; anyone who can open the page sees the records.
-- Receipts carry vendor names, not IDs: very different spellings of one vendor count as a new vendor.
-- Currency conversion covers USD, EUR and GBP only (fixed rates in `engine/config.py`). Don't mix other currencies
-  for the same vendor.
-- OCR takes about 7–15 s per photo on a laptop CPU and sometimes misreads fields, so you confirm them in a form first.
+  real edits. Genuine receipts are sometimes flagged, so a tamper flag only ever asks for a review. More forged training data
+  would help most; code changes alone won't fix it (see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)).
+- Very different spellings of one vendor still count as a new vendor unless you give its vendor ID.
+
+## Running it for a team
+
+- **Where:** a machine inside the company network: `python -m streamlit run app.py --server.address 0.0.0.0`. Colleagues
+  open `http://<machine>:8501`. Don't use free hosting with real invoices; its disk is wiped on restart.
+- **Password:** set `INVOICE_APP_PASSWORD` before starting the app, and everyone has to enter it. This is a single shared password,
+  with no individual accounts or roles.
+- **HTTPS:** add `--server.sslCertFile cert.pem --server.sslKeyFile key.pem` (or put it behind your company's reverse
+  proxy). Without it, traffic, including the password, is unencrypted on the network.
+- **Data at rest:** everything is in `data/invoices.db`. Keep the machine's disk encrypted (BitLocker, FileVault, LUKS).
+- **Backups:** the app backs up the database before every import. Schedule `python cli.py backup` daily (Task Scheduler or
+  cron). It writes `data/backups/`, keeps the last 30, and is safe while the app is running. To restore, stop the app and
+  copy a backup over `data/invoices.db`.
 
 ## Project layout
 
 ```
 app.py              web app (Streamlit)
-cli.py              command line: import, audit, check, demo, train-tamper
+cli.py              command line: import, audit, check, backup, demo, train-tamper
 engine/
   config.py         every threshold and path
   importer.py       CSV/Excel → records (column matching, vendor IDs)
@@ -123,7 +141,7 @@ engine/
   db.py             SQLite schema and helpers
 templates/          company records template
 models/tamper.joblib  shipped image-tamper model (the anomaly model is trained per company and not committed)
-tests/test_engine.py
+tests/test_engine.py  run by GitHub Actions on every push
 ```
 
 ## Credits
@@ -135,4 +153,4 @@ tests/test_engine.py
 - OCR: [RapidOCR](https://github.com/RapidAI/RapidOCR). String similarity: [RapidFuzz](https://github.com/rapidfuzz/RapidFuzz).
   Models: [scikit-learn](https://scikit-learn.org/).
 
-No license file has been added yet, so all rights are reserved by the author.
+Code: [MIT License](LICENSE). The shipped tamper model was trained on a research dataset; see its terms above.

@@ -117,5 +117,6 @@ def import_records(conn: sqlite3.Connection, df: pd.DataFrame, source: str = "im
         vendor_name_normalized=first["vendor_name"].map(normalize_vendor_name),
         erp_source=first["erp_source"] if "erp_source" in df.columns else None)
     db.add_vendors(conn, vendors)
-    db.append(conn, "invoices", df.reindex(columns=INVOICE_COLUMNS))
+    # Only columns the file has, so the schema defaults (currency USD, payment_status pending) apply to the rest
+    db.append(conn, "invoices", df[[c for c in INVOICE_COLUMNS if c in df.columns and df[c].notna().any()]])
     return len(df)
