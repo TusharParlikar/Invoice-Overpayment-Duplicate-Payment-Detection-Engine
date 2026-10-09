@@ -28,3 +28,6 @@ project.md
 PRODUCT_GUIDE.md
 issue*.md
 explain.md
+
+# Demo video: hosted on Google Drive (linked in the README), too large for the repo
+demo/*.mp4

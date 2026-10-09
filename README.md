@@ -14,7 +14,7 @@ It catches duplicates that exact-match ERP checks miss (`SAP-2024-123456` vs `SA
 
 ## Demo
 
-▶️ **[Watch the demo video](demo/demo_video.mp4)** (3¾ minutes, narrated): importing a year of invoices, an audit that
+▶️ **[Watch the demo video](https://drive.google.com/file/d/1J0F_hpMlzdyAN1gmBoHU7uYEiX8FU7Yz/view?usp=drive_link)** (3¾ minutes, narrated, on Google Drive): importing a year of invoices, an audit that
 finds money already lost, a batch check that holds duplicates and overpayments, a receipt photo recognized as already
 paid, and an edited receipt with the changed area outlined.
 
@@ -177,7 +177,7 @@ engine/
   db.py             SQLite schema and helpers
 templates/          company records template
 models/tamper.joblib  shipped image-tamper model
-demo/               mock data, demo video, and the scripts that make them (make_demo_data.py, record_demo_video.py)
+demo/               mock data, and the scripts that make it and record the demo video (make_demo_data.py, record_demo_video.py)
 tests/test_engine.py  rules, import and parser tests, run by GitHub Actions on every push
 tests/test_receipts.py  OCR + parser + tamper model on 4 committed receipts (tests/fixtures/), also run in CI
 tests/benchmark.py    accuracy on real records (10-fold)
