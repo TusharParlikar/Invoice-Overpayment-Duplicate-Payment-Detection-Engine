@@ -12,6 +12,37 @@
 It catches duplicates that exact-match ERP checks miss (`SAP-2024-123456` vs `SAP2024123456`, "Acme Corp" vs
 "ACME CORPORATION LLC", dates a few days apart). Everything runs locally: no data leaves your machine.
 
+## Problem statement
+
+An accounts-payable team pays every invoice that reaches it, often thousands a month, from many vendors, in many formats.
+Two kinds of error slip through:
+
+1. **Duplicate payments.** The same invoice is paid twice because it arrived twice (email and paper, a reminder copy), was
+   typed in with a different number format (`INV-0042` / `INV0042`), was misread by OCR (`O` for `0`), was entered under a
+   differently spelled vendor name, or was re-sent with tax added or the amount rounded up.
+2. **Overpayments.** An invoice is far above what that vendor normally charges, through a typing error, a wrong unit price,
+   or fraud.
+
+Accounting systems usually block a duplicate only when vendor, invoice number and amount match **exactly**, so every variant
+above passes. And edited receipt images (a changed total, a changed date) look genuine to a person checking them by eye.
+
+**Goal:** before an invoice is paid, compare it with everything already paid and say, with reasons, whether to pay it, look
+at it again, or hold it, catching the inexact duplicates, unusual amounts and edited images that exact matching misses.
+
+## Why we need this
+
+- **It's a measurable leak.** In APQC's accounts-payable benchmark, even top-performing organizations report that **0.8% of
+  their annual disbursements are duplicate or erroneous**; the bottom performers report **2%**
+  ([APQC via CFO.com, 2020](https://www.cfo.com/news/metric-of-the-month-detect-and-prevent-duplicate-or-erroneous-payments/656852/)).
+  These are shares of payments, not of money: a company making 50,000 payments a year would make roughly 400 to 1,000
+  duplicate or wrong ones.
+- **Catching it before payment is cheaper than recovering it after.** Once money has gone out, someone has to notice, contact
+  the vendor and wait for a refund or credit note. A check before payment just holds the invoice.
+- **Exact-match checks miss the common cases.** On the real receipts in the benchmark below, a different number format, an OCR
+  slip, a vendor-name variant or a shifted date each pass an exact-match check; this engine catches 97–100% of them.
+- **Small teams have no tool for it.** Duplicate-detection modules and recovery audits are built for large ERPs. This runs on
+  one laptop from a CSV export, keeps the data in-house, and explains every verdict in plain words.
+
 ## Demo
 
 ▶️ **[Watch the demo video](https://drive.google.com/file/d/1J0F_hpMlzdyAN1gmBoHU7uYEiX8FU7Yz/view?usp=drive_link)** (3¾ minutes, narrated, on Google Drive): importing a year of invoices, an audit that
@@ -139,17 +170,32 @@ Measured on real data: `python tests/benchmark.py`, 10-fold cross-validation on 
 - **Photos and emailed receipts:** the tamper check works on scans and good JPEGs (quality 85+). A JPEG below quality 85
   erases the traces it reads (3% caught at quality 75), so the app says *not checked* instead of implying the image is clean.
   A receipt that was **downscaled** can't be judged either (0% caught at half size), and this can't be detected from the
-  file: upload the original. Invoice numbers are read from 85% of photographed test receipts (70% exactly right), so check the
-  number in the form; the form warns when none was found.
+  file: upload the original. OCR doesn't always read the invoice number correctly, so check the number in the form; the
+  form warns when none was found.
 - Overpayment recall is low on this data because retail shop receipts vary enormously (one shop's receipts range from 5 to 465).
   With steady supplier invoices an unusual amount stands out far more. Accuracy on your own data: import a labelled sample with an
   `is_anomaly` column and the audit reports precision and recall.
 - The tamper model was trained only on Malaysian retail receipts; other document types are untested. A tamper flag only asks for a
   review, and the outlined area shows the reviewer what to compare.
-- **Speed** (100,000 records, laptop CPU): checking 1 invoice takes 0.5 s, and a full audit takes 7.5 s. OCR adds 7–15 s per photo, and the tamper check a few seconds.
+- **Speed** (100,000 records, laptop CPU): checking 1 invoice takes 0.2–0.3 s, a batch of 50 under 1.5 s, and a full audit
+  11–25 s. A check slows to about 30 s if most vendor names start with the same 3 letters. OCR adds 7–15 s per photo, and the
+  tamper check a few seconds.
 - Very different spellings of one vendor still count as a new vendor unless you give its vendor ID.
 
+### Where the numbers come from
+
+| Claim | Source | Reproduce |
+|---|---|---|
+| Duplicates 97–100% caught, re-billing 98%, genuine receipts flagged 5.3%, overpayment 53% / 40% / 26% | [tests/benchmark.py](tests/benchmark.py): 10-fold test on 534 real receipts from a public dataset; full table in [HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#evaluation-honesty) | `python tests/benchmark.py` (downloads 670 MB once) |
+| Edited images 71% caught, 71% of flags right, 66% on JPEG quality 90; 3% at quality 75, 0% at half size | Held-out test set of the tamper model; tables in [HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#image-tamper-model-enginetamperpy) | `python cli.py train-tamper` |
+| Speed: 0.2–0.3 s per check, 11–25 s audit on 100,000 records | [tests/speed.py](tests/speed.py): synthetic records, 2,000 vendors | `python tests/speed.py` |
+| OCR adds 7–15 s per photo | Observed while using the app; no script yet | — |
+| 0.8%–2% of payments are duplicate or erroneous | [APQC benchmark, via CFO.com](https://www.cfo.com/news/metric-of-the-month-detect-and-prevent-duplicate-or-erroneous-payments/656852/) | external |
+
 ## Running it for a team
+
+Where to keep the database, backups and samples, and how to move to a shared online database for several stores:
+[docs/STORE.md](docs/STORE.md).
 
 - **Where:** a machine inside the company network: `python -m streamlit run app.py --server.address 0.0.0.0`. Colleagues
   open `http://<machine>:8501`. Don't use free hosting with real invoices; its disk is wiped on restart.
@@ -181,6 +227,9 @@ demo/               mock data, and the scripts that make it and record the demo 
 tests/test_engine.py  rules, import and parser tests, run by GitHub Actions on every push
 tests/test_receipts.py  OCR + parser + tamper model on 4 committed receipts (tests/fixtures/), also run in CI
 tests/benchmark.py    accuracy on real records (10-fold)
+tests/speed.py        timing on 100,000 synthetic records
+docs/HOW_IT_WORKS.md  how each part works and how it was validated
+docs/STORE.md         where to store the data, locally and online
 ```
 
 ## Credits

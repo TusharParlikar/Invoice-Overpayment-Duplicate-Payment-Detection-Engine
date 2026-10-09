@@ -22,8 +22,9 @@ records that can change the new invoices' scores (same vendor ID, or the same 3-
 the same result as scoring against everything. Before scoring, an audit merges vendor IDs the engine generated for one
 company under two spellings (`importer.merge_split_vendors`): IDs created before name normalization improved split
 four vendors' histories in the demo records, weakening their amount statistics and hiding duplicates between the IDs.
-Only generated `V-...` IDs whose names now normalize identically are merged; IDs from the company's system are never touched. Measured on 100K records (laptop CPU): 0.5 s for one invoice, 3.5 s for a batch of 50, 7.5 s
-for a full audit.
+Only generated `V-...` IDs whose names now normalize identically are merged; IDs from the company's system are never touched. Measured with `python tests/speed.py` on 100K records from 2,000 vendors
+(laptop CPU, two runs): 0.2–0.3 s for one invoice, 0.6–1.2 s for a batch of 50, 11–25 s for a full audit. A check slows
+down when many vendors share the same first 3 letters, since they all land in one block (about 30 s with every vendor in one block).
 
 ## Scoring (`engine/scoring.py`)
 
