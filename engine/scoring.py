@@ -172,8 +172,9 @@ def apply_rules(df: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     ratio, amount = df["amount_to_vendor_median"], df["amount_usd"]
     rules = {}
-    # A later copy of the same vendor + invoice number + amount (the first stays clean)
-    rules["exact_dup"] = df.duplicated(["vendor_id", "invoice_id", "amount_usd"], keep="first").astype(float)
+    # A later copy of the same vendor + invoice number + amount (the first stays clean). Numbers are compared on
+    # letters and digits only: "SAP-2024-1" and "SAP20241" for the same amount are one invoice, however far apart
+    rules["exact_dup"] = df.duplicated(["vendor_id", "invoice_key", "amount_usd"], keep="first").astype(float)
     rules["near_dup"] = df["id"].map(pairs.groupby("record_b_id")["similarity_score"].max()).fillna(0.0)
     # The same number billed again for a different amount (tax added, rounded up, a "corrected" copy). A review,
     # not a hold: some vendors do reissue a number. Exact copies are left to exact_dup. A "number" on 3+ of the

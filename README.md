@@ -12,6 +12,21 @@
 It catches duplicates that exact-match ERP checks miss (`SAP-2024-123456` vs `SAP2024123456`, "Acme Corp" vs
 "ACME CORPORATION LLC", dates a few days apart). Everything runs locally: no data leaves your machine.
 
+## Demo
+
+▶️ **[Watch the demo video](demo/demo_video.mp4)** (3¾ minutes, narrated): importing a year of invoices, an audit that
+finds money already lost, a batch check that holds duplicates and overpayments, a receipt photo recognized as already
+paid, and an edited receipt with the changed area outlined.
+
+To try it yourself, [demo/](demo/) has the same mock data (all vendors are fictional): `company_records.csv` to import,
+`invoices_to_check.csv` with the expected verdict for each row, and two receipt images. Keep your real records separate
+by starting the app on a demo database:
+
+```powershell
+$env:INVOICE_DB_PATH = "data\demo.db"          # macOS/Linux: export INVOICE_DB_PATH=data/demo.db
+python -m streamlit run app.py
+```
+
 ---
 
 ## 1. Install
@@ -95,7 +110,7 @@ command line logs your system user name).
 
 | Check | Fires when | Verdict |
 |---|---|---|
-| Exact duplicate | Same vendor, invoice number and amount as a record | SUSPICIOUS |
+| Exact duplicate | Same vendor, invoice number (ignoring dashes and spaces) and amount as a record, however long ago | SUSPICIOUS |
 | Near duplicate | Same invoice in a different format: number differs only by dashes/spaces or a typo, or vendor name spelled differently (also with "The" in front); amount within 0.5%, date within 7 days. The vendor's next invoice (sequential number, new date) is not a duplicate | SUSPICIOUS |
 | Same number, new amount | Same vendor and invoice number (ignoring dashes and spaces) as a record, but a different amount: tax added, rounded up, a "corrected" copy | REVIEW |
 | Overpayment | At least 3× the median of the vendor's other invoices **and** far outside how much that vendor's amounts normally vary (needs 3+ past invoices) | SUSPICIOUS |
@@ -162,6 +177,7 @@ engine/
   db.py             SQLite schema and helpers
 templates/          company records template
 models/tamper.joblib  shipped image-tamper model
+demo/               mock data, demo video, and the scripts that make them (make_demo_data.py, record_demo_video.py)
 tests/test_engine.py  rules, import and parser tests, run by GitHub Actions on every push
 tests/test_receipts.py  OCR + parser + tamper model on 4 committed receipts (tests/fixtures/), also run in CI
 tests/benchmark.py    accuracy on real records (10-fold)

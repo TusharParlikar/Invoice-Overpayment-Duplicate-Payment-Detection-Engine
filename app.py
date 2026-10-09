@@ -62,8 +62,10 @@ with st.sidebar:
     if tamper.version_warning():
         st.warning(tamper.version_warning())
 
+# Always one element here: if the box vanished after the first import, Streamlit would rebuild the tabs and jump to the first
+start_here = st.empty()
 if n_records == 0:
-    st.info("**Start here.** Open **Company records**, download the template or upload your own export of past "
+    start_here.info("**Start here.** Open **Company records**, download the template or upload your own export of past "
             "invoices, import it, then click **Audit records**. After that you can check new invoices.")
 
 tab_one, tab_batch, tab_records = st.tabs(["Check one invoice", "Check a batch", "Company records"])
@@ -214,7 +216,7 @@ with tab_records:
 
     st.subheader("2. Audit records")
     st.caption("Scores every record for duplicates and overpayments already paid. Re-run after each import.")
-    if st.button("Audit records", disabled=n_records == 0):
+    if st.button("Audit records", disabled=db.count_invoices(conn) == 0):  # counted now: an import above may have just run
         with st.spinner("Auditing..."):
             s = checks.audit(conn)
         st.success(f"Audited {s['records']:,} records: {s.get('HIGH', 0):,} high risk, {s.get('MEDIUM', 0):,} medium."

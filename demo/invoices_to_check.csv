@@ -1,0 +1,16 @@
+invoice_number,vendor,invoice_date,amount,currency,po_number,expected
+NWO-2026-0001,Northwind Office Supplies Ltd,2026-01-12,1850.0,INR,,OK: a normal new invoice
+NWO-2025-0020,Northwind Office Supplies Ltd,2025-10-08,1850.85,INR,,SUSPICIOUS: exact copy of an invoice already paid
+SFM20250007,SUNRISE FACILITY MANAGEMENT LLC,2025-04-12,2933.44,USD,,"SUSPICIOUS: same invoice, number retyped without dashes, name in capitals"
+AIP 2025 0004,The Apex Industrial Parts Inc,2025-02-23,3901.11,USD,,"SUSPICIOUS: ""The"" added to the name, number retyped with spaces"
+OIT-2O25-0003,Orbit IT Solutions GmbH,2025-02-14,1194.52,EUR,,"SUSPICIOUS: OCR read a 0 as O, date 3 days off"
+HCC-2025-0006,Harbor Cleaning Co,2025-09-02,26357.05,INR,,REVIEW: same invoice number re-billed with 6% tax added
+GLC-2026-0001,Greenleaf Catering Services,2026-01-09,61000.0,INR,,SUSPICIOUS: about 6x what this caterer usually charges
+GLC-2026-0002,Greenleaf Catering Services,2026-01-16,21500.0,INR,,"REVIEW: about 2.3x the usual, worth a second look"
+HCC-2026-0001,Harbor Cleaning Co,2026-01-20,150000.0,INR,,"SUSPICIOUS: large round amount, 5.8x the usual"
+AIP-2026-001,Apex Industrial Parts Inc,2026-01-15,3100.0,USD,PO-AIP-777,"SUSPICIOUS: burst, 3 invoices on one PO and day (all three are held)"
+AIP-2026-002,Apex Industrial Parts Inc,2026-01-15,3350.0,USD,PO-AIP-777,"SUSPICIOUS: burst, 3 invoices on one PO and day (all three are held)"
+AIP-2026-003,Apex Industrial Parts Inc,2026-01-15,2980.0,USD,PO-AIP-777,"SUSPICIOUS: burst, 3 invoices on one PO and day (all three are held)"
+ZX-1001,Zenith Event Rentals,2026-01-18,7400.0,INR,,"OK: new vendor, no history to compare (the reason says so)"
+MPP-2026-0001,Metro Prnt and Pack,2026-01-19,13800.0,INR,,"OK: misspelled vendor, the reason suggests 'Metro Print & Pack'"
+EV-77,"=HYPERLINK(""http://example.com"",""click"")",2026-01-21,500.0,INR,,OK: a formula as vendor name; in the downloaded CSV it starts with ' so Excel won't run it
