@@ -86,12 +86,20 @@ _DATE_RES = [
     re.compile(r"\b(\d{1,2}\s*[-/ ]?\s*[A-Za-z]{3,9}\.?\s*[-/ ,]?\s*\d{2,4})\b"),  # 12 Mar 2024
     re.compile(r"\b([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})\b"),                 # March 12, 2024
 ]
-_INVOICE_ID_RE = re.compile(
-    r"\b(?:tax\s+)?(?:invoice|inv|receipt|rcpt|bill|doc(?:ument)?|ref(?:erence)?|trans(?:action)?|order|cs|slip)"
-    r"\s*(?:no|num|number|#|id)?\s*[.:#]?\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{2,})", re.I)
+# Lookaheads, so every position is tried: a consumed non-match ("TAX INVOICE" over a line break) used to hide
+# the real "INV NO.: 1187070" after it. Label, colon and number are often on separate lines. The number starts
+# after a separator ("CS00031383" keeps its prefix); one followed by "," or "&" is an address ("NO: 1-1&2 ...").
+# The document's own number (invoice, receipt, bill) wins over order, slip and terminal numbers; a bare "NO :"
+# or a line starting with ":" (its label lines above) is the last resort.
+_ID_LABELS = [r"\b(?:tax\s+)?(?:invoice|inv|receipt|rcpt|bill|doc(?:ument)?|c/n)[ \t\-]*(?:no|num|number|#|id)?",
+              r"\b(?:ref(?:erence)?|trans(?:action)?|trn|order|cs|slip|cb|check|chk|ticket)[ \t\-]*(?:no|num|number|#|id)?"
+              r"|^[ \t]*no[ \t]*\.?(?=\s*[:#])|^[ \t]*(?=:)"]
+_INVOICE_ID_RES = [re.compile(rf"(?=(?:{labels})\s*[.:#]?\s*[:#]?\s*(?<![A-Z0-9])([A-Z0-9](?:[A-Z0-9/]|-[ \t]?){{2,}})"
+                              r"(?![A-Z0-9\-/]|[ \t]*[,&]))", re.I | re.M) for labels in _ID_LABELS]
 _VENDOR_SKIP = re.compile(
     r"^(tax\s+invoice|invoice|receipt|official\s+receipt|cash\s+(sale|bill)|bill|welcome|thank)|"
-    r"reg(istration)?\.?\s*no|gst\s*(id|no|reg)|\btel\b|\bfax\b|tax\s*id", re.I)
+    r"reg(istration)?\.?\s*no|\bco(mpany)?\.?\s*no|gst\s*(id|no|reg)|\btel\b|\bfax\b|tax\s*id|:|"
+    r"^(lot|no)\b\W*\d|\bjalan\b|\bjln\b|\b\d{5}\b", re.I)  # addresses: "LOT 3, JALAN PELABUR 23/1,", postcodes
 _BUSINESS = re.compile(
     r"\b(sdn\.?\s*bhd|bhd|s/b|enterprise|trading|ltd|limited|llc|l\.l\.c|inc|corp(oration)?|co\.|company|gmbh|"
     r"pvt|plt|llp|store|stores|mart|supermarket|restaurant|cafe|hardware|pharmacy|services|industries|holdings)\b", re.I)
@@ -129,17 +137,19 @@ def parse_date(text: str, dayfirst: bool = True) -> str | None:
 
 
 def parse_invoice_id(text: str) -> str | None:
-    for m in _INVOICE_ID_RE.finditer(text):
-        candidate = m.group(1)
-        if any(c.isdigit() for c in candidate) and not any(rx.fullmatch(candidate) for rx in _DATE_RES):
-            return candidate.strip("-/")
+    for id_re in _INVOICE_ID_RES:
+        for m in id_re.finditer(text):
+            candidate = re.sub(r"\s", "", m.group(1)).strip("-/")  # "V001- 515592": a space read after a dash
+            if any(c.isdigit() for c in candidate) and not any(rx.fullmatch(candidate) for rx in _DATE_RES):
+                return candidate
     return None
 
 
 def parse_vendor(lines: list[str]) -> str | None:
     """Receipts put the seller's name at the top. Prefer a top line that looks like a business name
     (handwritten notes or a cashier's name can sit above it); else the first line with real words."""
-    top = [ln.strip() for ln in lines[:8] if sum(c.isalpha() for c in ln) >= 3 and not _VENDOR_SKIP.search(ln)]
+    top = [ln.strip() for ln in lines[:8]  # bracketed registration numbers don't make a line a field or address
+           if sum(c.isalpha() for c in ln) >= 3 and not _VENDOR_SKIP.search(re.sub(r"\(.*?\)", "", ln))]
     return next((ln for ln in top if _BUSINESS.search(ln)), top[0] if top else None)
 
 

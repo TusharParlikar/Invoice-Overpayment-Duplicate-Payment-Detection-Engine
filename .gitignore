@@ -14,20 +14,16 @@ __pycache__/
 env/
 venv/
 
-
 # Company data: records database, backups, exchange rates (never commit)
 *.db
 data/backups/
 data/exchange_rates.csv
 
-# Downloaded datasets and local test samples (dataset-derived images, answer keys)
-data/raw/
+# Local test samples (dataset-derived images, answer keys). The few receipts CI needs are in tests/fixtures/
 data/samples/
-
-# Anomaly model is trained on each company's own records; the tamper model ships
-models/anomaly.joblib
 
 # Personal notes
 github.md
 project.md
 PRODUCT_GUIDE.md
+issue*.md

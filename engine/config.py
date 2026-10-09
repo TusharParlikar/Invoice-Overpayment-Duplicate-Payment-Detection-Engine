@@ -6,7 +6,6 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.environ.get("INVOICE_DB_PATH", os.path.join(ROOT, "data", "invoices.db"))
-ANOMALY_MODEL_PATH = os.path.join(ROOT, "models", "anomaly.joblib")
 TAMPER_MODEL_PATH = os.path.join(ROOT, "models", "tamper.joblib")
 
 BACKUP_DIR = os.path.join(ROOT, "data", "backups")
@@ -19,7 +18,7 @@ USD_RATES = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "INR": 0.012, "MYR": 0.22, "C
              "JPY": 0.0067, "CNY": 0.14, "SGD": 0.74, "AED": 0.27, "CHF": 1.12}
 
 # Near-duplicate matching
-BLOCKING_KEY_LENGTH = 3               # only compare invoices whose cleaned vendor names share this many leading chars
+BLOCKING_KEY_LENGTH = 3               # compare invoices of one vendor ID, or whose cleaned names share this many leading chars
 NEAR_DUP_AMOUNT_TOLERANCE = 0.005     # candidate pair: amounts within 0.5% (+0.01)
 NEAR_DUP_DATE_WINDOW_DAYS = 7         # candidate pair: dates within this many days
 INVOICE_ID_MATCH_THRESHOLD = 0.85     # same vendor + invoice numbers this similar = duplicate
@@ -40,16 +39,6 @@ ROUND_NUMBER_MIN_AMOUNT = 25_000      # large round amount: at least this ...
 ROUND_NUMBER_STEP = 5_000             # ... a multiple of this ...
 ROUND_NUMBER_MIN_MEDIAN_RATIO = 2.5   # ... and this x the vendor's median
 
-# Anomaly model (Isolation Forest, trained on the company's own records)
-MIN_RECORDS_FOR_MODEL = 50            # fewer records than this: no model, checks use rules only
-ISOLATION_FOREST_CONTAMINATION = 0.01 # share of history labelled "unusual" (flag + reason only, not the score)
-ISOLATION_FOREST_N_ESTIMATORS = 200
-ISOLATION_FOREST_RANDOM_STATE = 42
-
-# Risk score = 60% rules + 40% anomaly model
-ENSEMBLE_RULE_WEIGHT = 0.6
-ENSEMBLE_ML_WEIGHT = 0.4
-STRONG_RULE_SCORE = 0.80              # a rule hit at least this strong ...
-STRONG_RULE_FLOOR = 0.88              # ... lifts the risk score to at least this
-RISK_HIGH_THRESHOLD = 0.7             # HIGH  -> verdict SUSPICIOUS
+# Risk score = the strongest rule's score
+RISK_HIGH_THRESHOLD = 0.8             # HIGH  -> verdict SUSPICIOUS
 RISK_MEDIUM_THRESHOLD = 0.4           # MEDIUM -> verdict REVIEW

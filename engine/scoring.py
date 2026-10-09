@@ -1,21 +1,17 @@
 """
 Score invoices for duplicates, overpayments and unusual amounts.
 
-    clean -> near-duplicate pairs -> per-vendor features -> 5 rules -> anomaly model -> risk score
+    clean -> near-duplicate pairs -> per-vendor features -> 6 rules -> risk score (the strongest rule)
 
 A full audit and a check of new invoices both run these same steps (see engine/checks.py).
 """
-import os
 import re
 from functools import cache
 
-import joblib
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
 
 from engine import config
 
@@ -28,10 +24,10 @@ _SUFFIXES = re.compile(r"\b(llc|inc|incorporated|corp|corporation|ltd|limited|co
 
 @cache
 def normalize_vendor_name(name) -> str:
-    """'ACME Corp., LLC' -> 'acme'; 'TRI SHAAS SDN BHD (728515-M)' -> 'tri shaas'."""
+    """'ACME Corp., LLC' -> 'acme'; 'TRI SHAAS SDN BHD (728515-M)' -> 'tri shaas'; 'The Acme Co' -> 'acme'."""
     if not isinstance(name, str):
         return ""
-    name = re.sub(r"[.,]", "", name.lower().strip())
+    name = re.sub(r"^the\s+", "", re.sub(r"[.,]", "", name.lower().strip()))
     bare = re.sub(r"\(.*?\)", " ", name)  # registration numbers and "(M)" are not part of the name
     out = re.sub(r"\s+", " ", _SUFFIXES.sub("", bare)).strip()
     return out or re.sub(r"\s+", " ", name).strip()  # "(SEMENYIH) SDN BHD": keep something to compare
@@ -54,6 +50,7 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     # A currency without a rate is compared as-is; checks say so in the reasons
     df["amount_usd"] = df["amount"] * df["currency"].map(usd_rates()).fillna(1.0)
     df["vendor_name_clean"] = df["vendor_name"].map(normalize_vendor_name)
+    df["invoice_key"] = df["invoice_id"].astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
     return df.fillna({"amount": 0, "amount_usd": 0})
 
 
@@ -65,7 +62,7 @@ PAIR_COLUMNS = ["record_a_id", "record_b_id", "similarity_score", "levenshtein_s
 def find_near_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Pairs of invoices that are the same invoice entered twice in different formats.
 
-    Candidates share a vendor-name prefix, amounts within NEAR_DUP_AMOUNT_TOLERANCE and dates within
+    Candidates share a vendor-name prefix or a vendor ID, amounts within NEAR_DUP_AMOUNT_TOLERANCE and dates within
     NEAR_DUP_DATE_WINDOW_DAYS. A candidate is confirmed when, for the same vendor, the invoice numbers
     match after removing dashes/spaces or are >= INVOICE_ID_MATCH_THRESHOLD similar; or when the vendor
     names are >= FUZZY_THRESHOLD similar (VENDOR_NAME_STRICT_THRESHOLD across vendor IDs) and the
@@ -80,8 +77,11 @@ def find_near_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     w["id_shape"] = w["clean_id"].str.replace(r"\d", "#", regex=True)  # INV0501 -> INV####
 
     pairs, candidates = [], 0
-    for block, g in w.groupby("block"):
-        if not block or len(g) < 2:
+    # Two blockings: the name prefix finds the same vendor under another ID, the vendor ID finds a name written
+    # differently ("THE ACME" vs "ACME"). A pair found by both is kept once.
+    groups = [g for block, g in w.groupby("block") if block] + [g for _, g in w.groupby("vendor_id")]
+    for g in groups:
+        if len(g) < 2:
             continue
         g = g.sort_values("amount_usd")
         # Plain lists: scalar access on numpy arrays is several times slower in this loop
@@ -116,45 +116,40 @@ def find_near_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
                     pairs.append((int(a), int(b), round(float(score), 4), round(float(lev), 4), round(float(jw), 4),
                                   "cross_erp_id" if same_id or similar_id else "vendor_variant"))
                 j += 1
-    return pd.DataFrame(pairs, columns=PAIR_COLUMNS), candidates
+    return pd.DataFrame(pairs, columns=PAIR_COLUMNS).drop_duplicates(["record_a_id", "record_b_id"]), candidates
 
 
 # ── Features (per vendor) ──────────────────────────────────────────────────
 
-# Duplicates are left to the rules; the model only sees how an amount and its timing compare with the vendor's history.
-FEATURES = ["amount_usd", "amount_robust_z", "amount_to_vendor_median", "amount_to_vendor_max",
-            "vendor_invoices_same_month", "days_since_last_invoice", "vendor_same_amount_count"]
 LOO_MAX_GROUP = 500  # above this many invoices one invoice barely moves the vendor's median, so all are used
 
 
-def _others_stats(a: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """For each amount: median, MAD and max of the vendor's *other* amounts (NaN if there are none).
+def _others_stats(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """For each amount: median and MAD of the vendor's *other* amounts (NaN if there are none).
 
     Leaving the invoice out matters: an overpayment included in its own baseline drags the baseline
     toward itself, which hid every overpayment at vendors with fewer than ~14 invoices.
     """
     m = len(a)
     if m == 1:
-        return np.full(1, np.nan), np.full(1, np.nan), np.full(1, np.nan)
+        return np.full(1, np.nan), np.full(1, np.nan)
     if m > LOO_MAX_GROUP:
         med = np.median(a)
-        return np.full(m, med), np.full(m, np.median(np.abs(a - med))), np.full(m, a.max())
+        return np.full(m, med), np.full(m, np.median(np.abs(a - med)))
     others = np.broadcast_to(a, (m, m))[~np.eye(m, dtype=bool)].reshape(m, m - 1)
     med = np.median(others, axis=1)
-    return med, np.median(np.abs(others - med[:, None]), axis=1), others.max(axis=1)
+    return med, np.median(np.abs(others - med[:, None]), axis=1)
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     amount = df["amount_usd"].to_numpy(float)
-    med, mx, n = (np.full(len(df), np.nan) for _ in range(3))
+    med, n = np.full(len(df), np.nan), np.full(len(df), np.nan)
     for idx in df.groupby("vendor_id").indices.values():
-        med[idx], _, mx[idx] = _others_stats(amount[idx])
+        med[idx], _ = _others_stats(amount[idx])
         n[idx] = len(idx) - 1
     df["vendor_history_count"] = n
-    df["vendor_median_others"] = med
-    df["amount_to_vendor_median"] = amount / np.where(med > 0, med, np.nan)
-    df["amount_to_vendor_max"] = amount / np.where(mx > 0, mx, np.nan)
+    df["amount_to_vendor_median"] = np.nan_to_num(amount / np.where(med > 0, med, np.nan), nan=1.0)
     # How unusual the amount is for this vendor, on a log scale: amounts vary by multiples (a supermarket bill of 5 or
     # 500 is normal, a supplier billing 1,000 every month is not), so 3x means much more for a steady vendor. Robust
     # z-score: median and MAD (x1.4826 = standard deviation for normal data) of the vendor's other invoices. A vendor
@@ -162,36 +157,35 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     log = np.log(np.maximum(amount, 0.01))
     lmed, lmad = (np.full(len(df), np.nan) for _ in range(2))
     for idx in df.groupby("vendor_id").indices.values():
-        lmed[idx], lmad[idx], _ = _others_stats(log[idx])
+        lmed[idx], lmad[idx] = _others_stats(log[idx])
     with np.errstate(divide="ignore", invalid="ignore"):
         z = (log - lmed) / (1.4826 * lmad)
-    df["amount_robust_z"] = np.clip(np.where((lmad == 0) & np.isclose(log, lmed), 0.0, z), -50, 50)
-
-    ordered = df.sort_values(["vendor_id", "invoice_date"])
-    gap = ordered["invoice_date"] - ordered.groupby("vendor_id")["invoice_date"].shift(1)
-    df["days_since_last_invoice"] = gap.dt.days.fillna(999.0)
-    month = df["invoice_date"].dt.to_period("M")
-    df["vendor_invoices_same_month"] = df.groupby([df["vendor_id"], month])["invoice_id"].transform("count").astype(float)
-    df["vendor_same_amount_count"] = df.groupby([df["vendor_id"], df["amount_usd"].round(1)])["invoice_id"].transform("count").astype(float)
-    df[FEATURES] = df[FEATURES].fillna({"amount_to_vendor_median": 1.0, "amount_to_vendor_max": 1.0}).fillna(0.0)
+    df["amount_robust_z"] = np.nan_to_num(np.clip(np.where((lmad == 0) & np.isclose(log, lmed), 0.0, z), -50, 50))
     return df
 
 
 # ── Rules ──────────────────────────────────────────────────────────────────
 
 def apply_rules(df: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
-    """Each rule scores 0-1; rule_score is the strongest, rule_flags names those that fired."""
+    """Each rule scores 0-1. final_score is the strongest, risk_category its tier (HIGH holds the payment,
+    MEDIUM asks for a review), flags names the rules that fired."""
     df = df.copy()
     ratio, amount = df["amount_to_vendor_median"], df["amount_usd"]
     rules = {}
     # A later copy of the same vendor + invoice number + amount (the first stays clean)
     rules["exact_dup"] = df.duplicated(["vendor_id", "invoice_id", "amount_usd"], keep="first").astype(float)
     rules["near_dup"] = df["id"].map(pairs.groupby("record_b_id")["similarity_score"].max()).fillna(0.0)
+    # The same number billed again for a different amount (tax added, rounded up, a "corrected" copy). A review,
+    # not a hold: some vendors do reissue a number. Exact copies are left to exact_dup. A "number" on 3+ of the
+    # vendor's invoices is a store, terminal or tax ID read as the invoice number (a Domino's GST ID on 5 receipts).
+    uses = df.groupby(["vendor_id", "invoice_key"])["invoice_key"].transform("size")
+    rebilled = (df["invoice_key"] != "") & (uses == 2) & df.duplicated(["vendor_id", "invoice_key"], keep="first")
+    rules["same_number"] = np.where(rebilled & (rules["exact_dup"] == 0), 0.6, 0.0)
     judged = df["vendor_history_count"] >= config.OVERPAYMENT_MIN_HISTORY
     z = df["amount_robust_z"]
     over = judged & (ratio >= config.OVERPAYMENT_MULTIPLIER) & (z >= config.OVERPAYMENT_MIN_ZSCORE)
     maybe_over = judged & (ratio >= config.OVERPAYMENT_REVIEW_MULTIPLIER) & (z >= config.OVERPAYMENT_REVIEW_ZSCORE)
-    # Strong evidence holds the payment (HIGH); moderate evidence asks for a review (0.7 x 60% rules weight = MEDIUM)
+    # Strong evidence holds the payment (HIGH); moderate evidence asks for a review (MEDIUM)
     rules["overpayment"] = np.where(over, np.maximum(0.85, (ratio - 1.0).clip(0.0, 5.0) / 5.0), np.where(maybe_over, 0.7, 0.0))
     burst = df.groupby(["vendor_id", "po_number", "invoice_date"])["invoice_id"].transform("count")
     rules["rapid_fire"] = np.where(burst >= config.RAPID_FIRE_MIN_COUNT, 0.90, 0.0)
@@ -200,78 +194,14 @@ def apply_rules(df: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
     rules["round_number"] = np.where(round_amt, 0.65, 0.0)
 
     scores = pd.DataFrame(rules, index=df.index)
-    df["rule_score"] = scores.max(axis=1).clip(upper=1.0)
-    df["rule_flags"] = scores.gt(0).dot(scores.columns + ",").str.rstrip(",").replace("", "none")
-    return df
-
-
-# ── Anomaly model (Isolation Forest on the company's own history) ──────────
-
-def train_model(df: pd.DataFrame) -> tuple[dict | None, pd.DataFrame]:
-    """Fit on the history and score it. Model is None when there is too little history to learn what normal looks like."""
-    if len(df) < config.MIN_RECORDS_FOR_MODEL:
-        return None, score_model(None, df)
-    scaler = StandardScaler()
-    X = scaler.fit_transform(df[FEATURES])
-    forest = IsolationForest(n_estimators=config.ISOLATION_FOREST_N_ESTIMATORS,
-                             random_state=config.ISOLATION_FOREST_RANDOM_STATE).fit(X)
-    samples = forest.score_samples(X)
-    offset = np.percentile(samples, 100.0 * config.ISOLATION_FOREST_CONTAMINATION)  # the "unusual" cutoff
-    raw = samples - offset
-    model = {"features": FEATURES, "scaler": scaler, "forest": forest, "offset": offset,
-             "raw_min": raw.min(), "raw_max": raw.max()}
-    return model, _with_scores(model, df, raw)
-
-
-def score_model(model: dict | None, df: pd.DataFrame) -> pd.DataFrame:
-    """ml_score 0-1 (higher = more unusual, relative to the training range); ml_prediction -1 = unusual."""
-    if model is None:
-        return df.assign(ml_score=0.0, ml_prediction=1)
-    raw = model["forest"].score_samples(model["scaler"].transform(df[FEATURES])) - model["offset"]
-    return _with_scores(model, df, raw)
-
-
-def _with_scores(model: dict, df: pd.DataFrame, raw: np.ndarray) -> pd.DataFrame:
-    span = model["raw_max"] - model["raw_min"]
-    return df.assign(ml_score=np.clip(1.0 - (raw - model["raw_min"]) / span, 0.0, 1.0) if span > 0 else 0.0,
-                     ml_prediction=np.where(raw < 0, -1, 1))
-
-
-def save_model(model: dict | None, path: str = config.ANOMALY_MODEL_PATH):
-    if model is None:
-        if os.path.exists(path):
-            os.remove(path)
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    joblib.dump(model, path)
-
-
-def load_model(path: str = config.ANOMALY_MODEL_PATH) -> dict | None:
-    """None if never trained, or trained by an older version on different features (re-run the audit)."""
-    try:
-        model = joblib.load(path)
-    except Exception:
-        return None
-    return model if isinstance(model, dict) and model.get("features") == FEATURES else None
-
-
-# ── Risk score ─────────────────────────────────────────────────────────────
-
-def blend(df: pd.DataFrame) -> pd.DataFrame:
-    """final_score = 60% rules + 40% model (a strong rule hit alone reaches HIGH), then risk tier and flags."""
-    df = df.copy()
-    score = config.ENSEMBLE_RULE_WEIGHT * df["rule_score"] + config.ENSEMBLE_ML_WEIGHT * df["ml_score"]
-    df["final_score"] = np.where(df["rule_score"] >= config.STRONG_RULE_SCORE,
-                                 np.maximum(score, config.STRONG_RULE_FLOOR), score)
+    df["final_score"] = scores.max(axis=1).clip(upper=1.0)
     df["risk_category"] = np.select([df["final_score"] >= config.RISK_HIGH_THRESHOLD,
                                      df["final_score"] >= config.RISK_MEDIUM_THRESHOLD], ["HIGH", "MEDIUM"], "LOW")
-    flags = df["rule_flags"].replace("none", "")
-    flags = flags.mask(df["ml_prediction"] == -1, (flags + ",ml_isolation_forest").str.lstrip(","))
-    df["all_flags"] = flags.replace("", "none")
+    df["flags"] = scores.gt(0).dot(scores.columns + ",").str.rstrip(",").replace("", "none")
     return df
 
 
-def score_rules(df: pd.DataFrame, new_ids=frozenset()) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+def score(df: pd.DataFrame, new_ids=frozenset()) -> tuple[pd.DataFrame, pd.DataFrame, int]:
     """Clean, match, featurize and apply rules. Returns (rows, near-duplicate pairs, candidates checked).
 
     new_ids: rows being checked; in a pair with a historical record they are always the duplicate side.

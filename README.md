@@ -6,7 +6,7 @@
 | Verdict | Meaning | What to do |
 |---|---|---|
 | **SUSPICIOUS** | It duplicates an invoice already on record, or the amount is far above what this vendor normally charges | Hold the payment and investigate |
-| **REVIEW** | Something is unusual but not conclusive (odd amount, or the image may have been edited) | Someone takes a second look |
+| **REVIEW** | Something is unusual but not conclusive (odd amount, a known invoice number with a new amount, or the image may have been edited) | Someone takes a second look |
 | **OK** | No match with existing records, and the amount is normal for this vendor | Pay as usual |
 
 It catches duplicates that exact-match ERP checks miss (`SAP-2024-123456` vs `SAP2024123456`, "Acme Corp" vs
@@ -16,11 +16,12 @@ It catches duplicates that exact-match ERP checks miss (`SAP-2024-123456` vs `SA
 
 ## 1. Install
 
-Python 3.10 or newer.
+Python 3.11 or newer.
 
 ```bash
 pip install -r requirements.txt
-python tests/test_engine.py        # should print 4 "ok" lines
+python tests/test_engine.py        # should print 6 "ok" lines
+python tests/test_receipts.py      # OCR, parser and tamper model on 4 real receipts: 3 "ok" lines
 python -m streamlit run app.py     # opens http://localhost:8501
 ```
 
@@ -47,24 +48,28 @@ thousands separators (`$1,250.00`). Rows missing a required value are skipped an
 in [templates/company_records_template.csv](templates/company_records_template.csv) and can also be downloaded in the app.
 
 **Step 2: Import it.** In the app open **Company records**, then upload the file, check the preview, and click
-**Import**. If your dates are written day-first (`15/01/2024`), tick *Dates are day-first*. You can import several
-files (one per year or per ERP); each import adds to the records.
+**Import**. The date order (`03/01/2024`: 3 January or March 1?) is detected from the file: any date like `13/01/2024`
+means day-first. If every date could be either, the app says so and reads them month-first; choose *Day first* in that
+case. You can import several files (one per year or per ERP); each import adds to the records. Rows already in the
+records (same vendor, number, date and amount) are skipped and counted, so importing a file twice does no harm.
 
 **Step 3: Check the exchange rates** (only if you pay in more than one currency). Amounts are converted to USD before
 they are compared. The app ships approximate rates for 12 common currencies; set your own under **Company records →
 Exchange rates**. A check tells you when an invoice's currency has no rate.
 
-**Step 4: Audit.** Click **Audit records & train model**. This scans all records for duplicates already paid
-(listed under *Highest-risk records*) and trains the anomaly model on your history. Re-run it after each import.
+**Step 4: Audit.** Click **Audit records**. This scans all records for duplicates already paid (listed under
+*Highest-risk records*). It also merges vendor IDs the engine created for one company under two spellings
+(`AEON CO. (M) BHD (126926-H)` and `AEON CO. (M) BHD`); vendor IDs from your own system are never changed. Re-run it
+after each import.
 
 Same steps from the command line:
 
 ```bash
-python cli.py import invoices_2024.xlsx        # add --dayfirst for dd/mm/yyyy dates
+python cli.py import invoices_2024.xlsx        # date order detected; force it with --dayfirst or --monthfirst
 python cli.py audit
 ```
 
-**No data yet?** `python cli.py demo` loads about 380 real scanned receipts as sample records (it downloads a 670 MB
+**No data yet?** `python cli.py demo` loads about 530 real scanned receipts as sample records (it downloads a 670 MB
 research dataset once).
 
 ## 3. Check new invoices
@@ -72,15 +77,17 @@ research dataset once).
 In the app:
 
 - **Check one invoice:** upload a photo, scan or PDF (the fields are read automatically, and you correct anything
-  misread) or type the fields in, then click **Check**. If the vendor's name on the document differs from your records,
-  the result suggests the closest known vendor; fix the name or enter its **Vendor ID**. Once the invoice is paid,
-  click **Add to company records** so a later copy of it is caught.
+  misread) or type the fields in, then click **Check**. If no invoice number could be read, the form says so: type it
+  in, since duplicates are matched on it. If the vendor's name on the document differs from your records, the result
+  suggests the closest known vendor; fix the name or enter its **Vendor ID**. Once the invoice is paid, click **Add to
+  company records** so a later copy of it is caught (not offered for a SUSPICIOUS invoice).
 - **Check a batch:** upload the invoices due for payment (same columns as above). You get a verdict per invoice and a
   CSV download.
 
 From the command line: `python cli.py check due_this_week.xlsx --out results.csv`.
 
-Every check is logged in the *Recent checks* table.
+Every check is logged in the *Recent checks* table, with the name entered under *Your name* in the sidebar (the
+command line logs your system user name).
 
 ---
 
@@ -89,12 +96,12 @@ Every check is logged in the *Recent checks* table.
 | Check | Fires when | Verdict |
 |---|---|---|
 | Exact duplicate | Same vendor, invoice number and amount as a record | SUSPICIOUS |
-| Near duplicate | Same invoice in a different format: number differs only by dashes/spaces or a typo, or vendor name spelled differently; amount within 0.5%, date within 7 days. The vendor's next invoice (sequential number, new date) is not a duplicate | SUSPICIOUS |
+| Near duplicate | Same invoice in a different format: number differs only by dashes/spaces or a typo, or vendor name spelled differently (also with "The" in front); amount within 0.5%, date within 7 days. The vendor's next invoice (sequential number, new date) is not a duplicate | SUSPICIOUS |
+| Same number, new amount | Same vendor and invoice number (ignoring dashes and spaces) as a record, but a different amount: tax added, rounded up, a "corrected" copy | REVIEW |
 | Overpayment | At least 3× the median of the vendor's other invoices **and** far outside how much that vendor's amounts normally vary (needs 3+ past invoices) | SUSPICIOUS |
 | Possible overpayment | At least 2× the median and clearly outside the vendor's normal range | REVIEW |
 | Burst | 3+ invoices from one vendor on the same PO and date | SUSPICIOUS |
 | Large round amount | At least 25,000, a multiple of 5,000, and 2.5× the vendor's median | REVIEW |
-| Anomaly model | Unusual compared with your own payment history (Isolation Forest) | REVIEW at most |
 | Image tamper | Pixel statistics suggest part of a photo or scan was edited; the app outlines the area | REVIEW at most |
 
 All thresholds are in [engine/config.py](engine/config.py). How each part works, the models, and how they were
@@ -102,15 +109,23 @@ validated: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).
 
 ## Results and limitations
 
-Measured on real data (`python tests/benchmark.py`, 10-fold cross-validation on 377 real receipts):
+Measured on real data: `python tests/benchmark.py`, 10-fold cross-validation on the 534 real receipts that
+`python cli.py demo` loads from a public dataset, so anyone can reproduce it:
 
 | | Result |
 |---|---|
-| Duplicates: exact copy, retyped number, OCR misread, date shifted, vendor name written differently | 99–100% caught |
-| Genuine receipts flagged | 3.8% (2.1% held as SUSPICIOUS, the rest REVIEW) |
-| Overpayment 10× / 5× / 3× | 38% / 33% / 17% caught |
-| Edited receipt images (held-out test set) | 69% caught; 75% of flags are real edits |
+| Duplicates: exact copy, retyped number, OCR misread, date shifted, vendor name written differently, "The" added | 97–100% caught |
+| Same number re-billed with tax added or rounded up | 98% caught (REVIEW) |
+| Genuine receipts flagged | 5.3% (2.6% held as SUSPICIOUS, the rest REVIEW) |
+| Overpayment 10× / 5× / 3× | 53% / 40% / 26% caught |
+| Edited receipt images, original scan (held-out test set) | 71% caught; 71% of flags are real edits; 5.5% of genuine flagged |
+| Edited receipt images, same scans as JPEG quality 90 | 66% caught; 5.5% of genuine flagged |
 
+- **Photos and emailed receipts:** the tamper check works on scans and good JPEGs (quality 85+). A JPEG below quality 85
+  erases the traces it reads (3% caught at quality 75), so the app says *not checked* instead of implying the image is clean.
+  A receipt that was **downscaled** can't be judged either (0% caught at half size), and this can't be detected from the
+  file: upload the original. Invoice numbers are read from 85% of photographed test receipts (70% exactly right), so check the
+  number in the form; the form warns when none was found.
 - Overpayment recall is low on this data because retail shop receipts vary enormously (one shop's receipts range from 5 to 465).
   With steady supplier invoices an unusual amount stands out far more. Accuracy on your own data: import a labelled sample with an
   `is_anomaly` column and the audit reports precision and recall.
@@ -124,7 +139,7 @@ Measured on real data (`python tests/benchmark.py`, 10-fold cross-validation on 
 - **Where:** a machine inside the company network: `python -m streamlit run app.py --server.address 0.0.0.0`. Colleagues
   open `http://<machine>:8501`. Don't use free hosting with real invoices; its disk is wiped on restart.
 - **Password:** set `INVOICE_APP_PASSWORD` before starting the app, and everyone has to enter it. This is a single shared password,
-  with no individual accounts or roles.
+  with no individual accounts or roles; the check log records the name each person types in the sidebar, which is not verified.
 - **HTTPS:** add `--server.sslCertFile cert.pem --server.sslKeyFile key.pem` (or put it behind your company's reverse
   proxy). Without it, traffic, including the password, is unencrypted on the network.
 - **Data at rest:** everything is in `data/invoices.db`. Keep the machine's disk encrypted (BitLocker, FileVault, LUKS).
@@ -140,14 +155,15 @@ cli.py              command line: import, audit, check, backup, demo, train-tamp
 engine/
   config.py         every threshold and path
   importer.py       CSV/Excel → records (column matching, vendor IDs)
-  scoring.py        cleaning, near-duplicate matching, features, rules, anomaly model, risk score
+  scoring.py        cleaning, near-duplicate matching, per-vendor amount statistics, rules, risk score
   checks.py         audit all records; check new invoices; reasons
   receipts.py       OCR and field extraction from photos/PDFs
   tamper.py         image-tamper model and its training
   db.py             SQLite schema and helpers
 templates/          company records template
-models/tamper.joblib  shipped image-tamper model (the anomaly model is trained per company and not committed)
-tests/test_engine.py  run by GitHub Actions on every push
+models/tamper.joblib  shipped image-tamper model
+tests/test_engine.py  rules, import and parser tests, run by GitHub Actions on every push
+tests/test_receipts.py  OCR + parser + tamper model on 4 committed receipts (tests/fixtures/), also run in CI
 tests/benchmark.py    accuracy on real records (10-fold)
 ```
 
@@ -158,6 +174,6 @@ tests/benchmark.py    accuracy on real records (10-fold)
   ([dataset page](https://l3i-share.univ-lr.fr/2023Finditagain/index.html)). Published for research; check its terms
   before commercial use of the tamper model.
 - OCR: [RapidOCR](https://github.com/RapidAI/RapidOCR). String similarity: [RapidFuzz](https://github.com/rapidfuzz/RapidFuzz).
-  Models: [scikit-learn](https://scikit-learn.org/).
+  Tamper model: [scikit-learn](https://scikit-learn.org/).
 
 Code: [MIT License](LICENSE). The shipped tamper model was trained on a research dataset; see its terms above.

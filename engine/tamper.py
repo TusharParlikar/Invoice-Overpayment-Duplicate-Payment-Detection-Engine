@@ -17,6 +17,7 @@ import io
 import os
 import urllib.request
 import zipfile
+import zlib
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import cache
 
@@ -31,6 +32,7 @@ BLOCK = 32
 INK_STD = 12.0           # grayscale std above which a block holds printed content, not blank paper
 ELA_QUALITIES = (75, 90, 95)
 FEATURE_VERSION = 2      # bump when block_features changes, to invalidate cached training features
+JPEG_MIN_QUALITY = 85    # below this a JPEG upload is "can't assess" (see cannot_assess)
 
 DATASET_URL = "https://l3i-share.univ-lr.fr/2023Finditagain/findit2.zip"
 # Outside the repo (and outside synced folders, which can mangle a 670 MB file mid-sync)
@@ -82,17 +84,61 @@ def block_features(img: Image.Image) -> pd.DataFrame:
 
 @cache
 def _bundle():
-    b = joblib.load(config.TAMPER_MODEL_PATH) if os.path.exists(config.TAMPER_MODEL_PATH) else None
-    return b if isinstance(b, dict) and "features" in b else None
+    """The saved model, or None if it is missing or can't be loaded (e.g. saved by another scikit-learn)."""
+    try:
+        b = joblib.load(config.TAMPER_MODEL_PATH)
+    except Exception:
+        return None
+    return b if isinstance(b, dict) and "thresholds" in b else None
 
 
 def available() -> bool:
     return _bundle() is not None
 
 
+def version_warning() -> str | None:
+    """Set when the model was saved by a different scikit-learn than the one installed: it may score differently."""
+    import sklearn
+    b = _bundle()
+    if b is None or b.get("sklearn_version") == sklearn.__version__:
+        return None
+    return (f"The image-tamper model was saved with scikit-learn {b.get('sklearn_version', '(unknown)')}, but "
+            f"{sklearn.__version__} is installed, so its scores may differ. Install requirements.txt or run "
+            "python cli.py train-tamper.")
+
+
+# Standard JPEG luminance quantization table (ITU T.81, Annex K), scaled by quality as libjpeg does
+_JPEG_LUMA = np.array([16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
+                       14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
+                       49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99])
+
+
+def jpeg_quality(img: Image.Image) -> int | None:
+    """Estimated quality (1-100) of a JPEG file, from its luminance table; None if the image isn't a JPEG."""
+    tables = getattr(img, "quantization", None)
+    if img.format != "JPEG" or not tables:
+        return None
+    table = np.sort(np.asarray(tables[min(tables)]))  # sorted: writers differ in the order they store it
+
+    def scaled(q):
+        f = 5000 / q if q < 50 else 200 - 2 * q
+        return np.sort(np.clip((_JPEG_LUMA * f + 50) // 100, 1, 255))
+    return min(range(1, 101), key=lambda q: np.abs(scaled(q) - table).sum())
+
+
+def cannot_assess(img: Image.Image) -> str | None:
+    """Why this image can't be scored reliably, or None. On the dataset's test split, JPEGs at quality 75
+    hide almost every edit, so "not flagged" would mean nothing."""
+    q = jpeg_quality(img)
+    if q is not None and q < JPEG_MIN_QUALITY:
+        return (f"not checked: the image is a JPEG saved at quality {q}, and compression that strong erases the "
+                "traces the model reads. Upload the original scan or a PNG")
+    return None
+
+
 def tamper_score(img: Image.Image) -> tuple[float, bool, tuple[int, int, int, int] | None] | None:
-    """(probability the image was edited, flagged at the validated threshold, (x, y, w, h) of the most
-    suspicious area), or None if no model is installed."""
+    """(probability the image was edited, flagged at the threshold validated for its format, (x, y, w, h) of the
+    most suspicious area), or None if no model is installed. Check cannot_assess() first."""
     b = _bundle()
     if b is None:
         return None
@@ -101,7 +147,8 @@ def tamper_score(img: Image.Image) -> tuple[float, bool, tuple[int, int, int, in
         return 0.0, False, None
     p = b["model"].predict_proba(blocks[b["features"]])[:, 1]
     top = blocks.iloc[int(p.argmax())]
-    return float(p.max()), bool(p.max() >= b["threshold"]), (int(top.bx) * BLOCK, int(top.by) * BLOCK, BLOCK, BLOCK)
+    threshold = b["thresholds"]["jpeg" if img.format == "JPEG" else "scan"]
+    return float(p.max()), bool(p.max() >= threshold), (int(top.bx) * BLOCK, int(top.by) * BLOCK, BLOCK, BLOCK)
 
 
 # ── Dataset ────────────────────────────────────────────────────────────────
@@ -179,7 +226,34 @@ def demo_history() -> pd.DataFrame:
 
 # ── Training ───────────────────────────────────────────────────────────────
 
-def _edited_blocks(annotation, blocks: pd.DataFrame) -> np.ndarray:
+# Uploads are rarely the lossless scans the dataset holds: phone photos and emailed receipts are JPEG. Each training
+# receipt is also seen as a JPEG (quality 85-95), and JPEGs get their own threshold. Smaller copies were tried too:
+# the model learned nothing from them (test ROC-AUC 0.54 at half size) and they lowered the threshold for scans, so a
+# downscaled receipt simply can't be judged. The test split is reported under fixed versions of each condition.
+TRAIN_VARIANTS = ("scan", "jpeg")
+TEST_CONDITIONS = {"scan": (1.0, None), "jpeg90": (1.0, 90), "jpeg75": (1.0, 75), "half": (0.5, None)}
+
+
+def _degrade(img: Image.Image, scale: float, quality: int | None) -> Image.Image:
+    img = img.convert("RGB")
+    if scale != 1.0:
+        img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
+    if quality:
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=quality)
+        img = Image.open(buf)
+    return img
+
+
+def _train_condition(image: str, variant: str) -> tuple[float, int | None]:
+    """Random (scale, JPEG quality) for one training copy, fixed per receipt so cached features stay valid."""
+    rng = np.random.default_rng(zlib.crc32(f"{image}|{variant}".encode()))
+    if variant == "jpeg":
+        return 1.0, int(rng.integers(JPEG_MIN_QUALITY, 96))
+    return 1.0, None
+
+
+def _edited_blocks(annotation, blocks: pd.DataFrame, scale: float = 1.0) -> np.ndarray:
     """Blocks inside regions marked as edited. "Original area: yes" marks where a copied piece came from."""
     edited = np.zeros(len(blocks), bool)
     ann = ast.literal_eval(annotation) if isinstance(annotation, str) else None
@@ -190,27 +264,31 @@ def _edited_blocks(annotation, blocks: pd.DataFrame) -> np.ndarray:
         kinds = attrs.get("Modified area", {})
         if attrs.get("Original area") != "no" or (isinstance(kinds, dict) and not any(v for k, v in kinds.items() if k != "None")):
             continue
-        x0, y0 = s["x"] // BLOCK, s["y"] // BLOCK
-        x1, y1 = (s["x"] + s["width"]) // BLOCK, (s["y"] + s["height"]) // BLOCK
+        x0, y0 = int(s["x"] * scale) // BLOCK, int(s["y"] * scale) // BLOCK
+        x1, y1 = int((s["x"] + s["width"]) * scale) // BLOCK, int((s["y"] + s["height"]) * scale) // BLOCK
         edited |= (blocks["bx"].between(x0, x1) & blocks["by"].between(y0, y1)).to_numpy()
     return edited
 
 
-def _image_blocks(path: str) -> pd.DataFrame:
+def _image_blocks(job: tuple[str, float, int | None]) -> pd.DataFrame:
+    path, scale, quality = job
     with Image.open(path) as img:
-        return block_features(img)
+        return block_features(_degrade(img, scale, quality))
 
 
-def _blocks(split: str) -> pd.DataFrame:
-    """Labelled blocks for a split, cached next to the dataset (extraction takes several minutes)."""
-    path = os.path.join(CACHE_DIR, f"blocks_{split}_v{FEATURE_VERSION}.pkl")
+def _blocks(split: str, variant: str) -> pd.DataFrame:
+    """Labelled blocks for a split under one upload condition (a TRAIN_VARIANTS or TEST_CONDITIONS name),
+    cached next to the dataset (extraction takes several minutes)."""
+    path = os.path.join(CACHE_DIR, f"blocks_{split}_v{FEATURE_VERSION}.pkl" if variant == "scan"
+                        else f"blocks_{split}_{variant}_v{FEATURE_VERSION}.pkl")
     if os.path.exists(path):
         return pd.read_pickle(path)
     meta = load_split(split)
-    with ProcessPoolExecutor(min(4, os.cpu_count() or 1)) as pool:  # each worker holds a full-size scan
-        parts = list(pool.map(_image_blocks, meta["path"], chunksize=4))
-    for r, b in zip(meta.itertuples(), parts):
-        b["edited"] = _edited_blocks(r.annotation, b) if r.forged else False
+    conds = [TEST_CONDITIONS[variant] if variant in TEST_CONDITIONS else _train_condition(i, variant) for i in meta["image"]]
+    with ProcessPoolExecutor(min(6, os.cpu_count() or 1)) as pool:  # each worker holds a full-size scan
+        parts = list(pool.map(_image_blocks, [(p, *c) for p, c in zip(meta["path"], conds)], chunksize=4))
+    for r, (scale, _), b in zip(meta.itertuples(), conds, parts):
+        b["edited"] = _edited_blocks(r.annotation, b, scale) if r.forged else False
         b["image"], b["forged"] = r.image, r.forged
     out = pd.concat(parts, ignore_index=True)
     out.to_pickle(path)
@@ -223,40 +301,48 @@ def _per_image(blocks: pd.DataFrame, p: np.ndarray) -> pd.DataFrame:
 
 
 def train() -> dict:
-    """Train on train+val. The threshold comes from cross-validated predictions, with folds split by receipt
-    so blocks of one receipt never sit on both sides. The test split is only used for the final report."""
+    """Train on train+val, each receipt as a scan and as a JPEG. One threshold per format, from cross-validated
+    predictions, with folds split by receipt so no copy of one receipt sits on both sides. The test split is only
+    used for the final report, per upload condition."""
+    import sklearn
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
     from sklearn.model_selection import StratifiedGroupKFold
 
     print("Extracting block features ...")
-    dev = pd.concat([_blocks("train"), _blocks("val")], ignore_index=True)
-    test = _blocks("test")
-    features = [c for c in dev.columns if c not in ("bx", "by", "edited", "image", "forged")]
+    dev = pd.concat([_blocks(s, v).assign(receipt=lambda d: d["image"], image=lambda d, v=v: d["image"] + "|" + v)
+                     for s in ("train", "val") for v in TRAIN_VARIANTS], ignore_index=True)
+    features = [c for c in dev.columns if c not in ("bx", "by", "edited", "image", "receipt", "forged")]
     make = lambda: HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
                                                   min_samples_leaf=50, l2_regularization=1.0,
                                                   class_weight="balanced", random_state=0)
 
+    print("Cross-validating ...")
     oof = np.zeros(len(dev))
     folds = StratifiedGroupKFold(5, shuffle=True, random_state=0)
-    for tr, va in folds.split(dev, dev["forged"], groups=dev["image"]):
+    for tr, va in folds.split(dev, dev["forged"], groups=dev["receipt"]):
         oof[va] = make().fit(dev.loc[tr, features], dev.loc[tr, "edited"]).predict_proba(dev.loc[va, features])[:, 1]
     cv = _per_image(dev, oof)
-    threshold = float(max(np.unique(cv["score"]), key=lambda t: f1_score(cv["forged"], cv["score"] >= t)))
+    best_f1 = lambda c: float(max(np.unique(c["score"]), key=lambda t: f1_score(c["forged"], c["score"] >= t)))
+    thresholds = {v: best_f1(cv[cv.index.str.endswith("|" + v)]) for v in TRAIN_VARIANTS}
 
     model = make().fit(dev[features], dev["edited"])
     fit = _per_image(dev, model.predict_proba(dev[features])[:, 1])
-    held = _per_image(test, model.predict_proba(test[features])[:, 1])
-    flagged = held["score"] >= threshold
     metrics = {"train_roc_auc": roc_auc_score(fit["forged"], fit["score"]),
                "cv_roc_auc": roc_auc_score(cv["forged"], cv["score"]),
-               "test_roc_auc": roc_auc_score(held["forged"], held["score"]),
-               "test_precision": precision_score(held["forged"], flagged, zero_division=0),
-               "test_recall": recall_score(held["forged"], flagged, zero_division=0),
-               "test_f1": f1_score(held["forged"], flagged, zero_division=0),
-               "threshold": threshold, "train_receipts": len(fit), "test_receipts": len(held),
-               "test_forged": int(held["forged"].sum())}
+               **{f"threshold_{v}": t for v, t in thresholds.items()}, "train_receipts": dev["receipt"].nunique()}
+    for cond, (_, quality) in TEST_CONDITIONS.items():
+        test = _blocks("test", cond)
+        held = _per_image(test, model.predict_proba(test[features])[:, 1])
+        flagged = held["score"] >= thresholds["jpeg" if quality else "scan"]
+        genuine = held["forged"] == 0
+        metrics |= {f"{cond}_roc_auc": roc_auc_score(held["forged"], held["score"]),
+                    f"{cond}_recall": recall_score(held["forged"], flagged, zero_division=0),
+                    f"{cond}_precision": precision_score(held["forged"], flagged, zero_division=0),
+                    f"{cond}_f1": f1_score(held["forged"], flagged, zero_division=0),
+                    f"{cond}_genuine_flagged": float(flagged[genuine].mean())}
+    metrics |= {"test_receipts": len(held), "test_forged": int(held["forged"].sum())}
     os.makedirs(os.path.dirname(config.TAMPER_MODEL_PATH), exist_ok=True)
-    joblib.dump({"model": model, "features": features, "threshold": threshold, "metrics": metrics},
-                config.TAMPER_MODEL_PATH)
+    joblib.dump({"model": model, "features": features, "thresholds": thresholds, "metrics": metrics,
+                 "sklearn_version": sklearn.__version__}, config.TAMPER_MODEL_PATH)
     return metrics

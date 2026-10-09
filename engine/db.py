@@ -40,8 +40,6 @@ CREATE TABLE IF NOT EXISTS invoices (
 CREATE TABLE IF NOT EXISTS detection_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     invoice_row_id INTEGER NOT NULL,
-    rule_score REAL DEFAULT 0.0,
-    ml_score REAL DEFAULT 0.0,
     final_score REAL DEFAULT 0.0,
     risk_category TEXT,
     flags TEXT,
@@ -64,7 +62,8 @@ CREATE TABLE IF NOT EXISTS receipt_checks (
     risk_category TEXT,
     flags TEXT,
     tamper_score REAL,
-    verdict TEXT
+    verdict TEXT,
+    checked_by TEXT              -- name entered in the app, or the OS user for cli.py
 );
 
 -- Left behind by older versions
@@ -88,6 +87,8 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA cache_size=-65536")  # 64 MB: the 2 MB default thrashes on 100K-row imports
     conn.executescript(SCHEMA)
+    if "checked_by" not in {r[1] for r in conn.execute("PRAGMA table_info(receipt_checks)")}:  # older databases
+        conn.execute("ALTER TABLE receipt_checks ADD COLUMN checked_by TEXT")
     return conn
 
 

@@ -46,8 +46,23 @@ def read_table(file) -> pd.DataFrame:
     return pd.read_csv(file, low_memory=False)
 
 
-def normalize(raw: pd.DataFrame, dayfirst: bool = False) -> tuple[pd.DataFrame, list[str]]:
-    """Map columns to the invoice schema and coerce types. Returns (valid rows, problems found)."""
+def detect_dayfirst(dates: pd.Series) -> tuple[bool, str | None]:
+    """Date order of text dates like 03/01/2024: a first part above 12 means day-first, a second part above 12
+    month-first. Returns (dayfirst, a warning when the file doesn't say or says both)."""
+    parts = dates.astype(str).str.extract(r"^\s*(\d{1,2})[/.\-](\d{1,2})[/.\-]\d{2,4}\b").dropna().astype(int)
+    day, month = bool((parts[0] > 12).any()), bool((parts[1] > 12).any())
+    if day and month:
+        return True, ("Dates are written in both orders (some like 13/01, some like 01/13). They were read as day-first; "
+                      "rows that don't fit were skipped. Check the file.")
+    if day or month or parts.empty:
+        return day, None
+    return False, ("Every date like 03/01/2024 could be day- or month-first; they were read as month-first "
+                   "(March 1). If they are day-first, choose day-first and load the file again.")
+
+
+def normalize(raw: pd.DataFrame, dayfirst: bool | None = None) -> tuple[pd.DataFrame, list[str]]:
+    """Map columns to the invoice schema and coerce types. Returns (valid rows, problems found).
+    dayfirst: date order of text dates like 03/01/2024; None detects it from the file."""
     lookup = {alias: field for field, names in ALIASES.items() for alias in [field.replace("_", " "), *names]}
     rename = {}
     for col in raw.columns:
@@ -61,6 +76,9 @@ def normalize(raw: pd.DataFrame, dayfirst: bool = False) -> tuple[pd.DataFrame, 
         return df.iloc[0:0], [f"Missing required column(s): {', '.join(missing)}. Found: {', '.join(map(str, raw.columns))}"]
 
     problems = []
+    if dayfirst is None:
+        dayfirst, warning = detect_dayfirst(df["invoice_date"])
+        problems += [warning] if warning else []
     df["invoice_id"] = df["invoice_id"].astype(str).str.strip()
     df["vendor_name"] = df["vendor_name"].astype(str).str.strip()
     df["amount"] = pd.to_numeric(df["amount"].astype(str).str.replace(r"[^\d.\-]", "", regex=True), errors="coerce")
@@ -102,7 +120,10 @@ def resolve_vendor_ids(names: pd.Series, vendors: pd.DataFrame) -> pd.Series:
 
 
 def import_records(conn: sqlite3.Connection, df: pd.DataFrame, source: str = "import") -> int:
-    """Insert normalized rows (see normalize) and any new vendors. Returns rows inserted."""
+    """Insert normalized rows (see normalize) and any new vendors. Returns rows inserted.
+
+    Rows already in the records (same vendor, number, date and amount) are skipped, so importing a file twice
+    doesn't turn every row into a duplicate. Repeats within one file are kept: they may be real double payments."""
     if df.empty:
         return 0
     df = df.copy()
@@ -112,6 +133,13 @@ def import_records(conn: sqlite3.Connection, df: pd.DataFrame, source: str = "im
     df["vendor_id"] = df["vendor_id"].astype(str)
     df["source"] = source
 
+    key = ["vendor_id", "invoice_id", "invoice_date", "amount"]
+    as_text = lambda d: d[key].astype({"amount": float}).astype(str)  # same types on both sides, even when empty
+    have = as_text(db.query(conn, f"SELECT DISTINCT {', '.join(key)} FROM invoices"))
+    df = df[as_text(df).merge(have, on=key, how="left", indicator=True)["_merge"].eq("left_only").to_numpy()]
+    if df.empty:
+        return 0
+
     first = df.drop_duplicates("vendor_id")
     vendors = first[["vendor_id", "vendor_name"]].assign(
         vendor_name_normalized=first["vendor_name"].map(normalize_vendor_name),
@@ -120,3 +148,20 @@ def import_records(conn: sqlite3.Connection, df: pd.DataFrame, source: str = "im
     # Only columns the file has, so the schema defaults (currency USD, payment_status pending) apply to the rest
     db.append(conn, "invoices", df[[c for c in INVOICE_COLUMNS if c in df.columns and df[c].notna().any()]])
     return len(df)
+
+
+def merge_split_vendors(conn: sqlite3.Connection) -> int:
+    """One vendor under several generated IDs ("V-..."), created before name normalization improved
+    ('AEON CO. (M) BHD (126926-H)' and 'AEON CO. (M) BHD'), splits its history and hides duplicates between
+    them. IDs whose names now normalize the same are merged into the one with the most invoices. IDs from
+    the company's own system are left alone. Returns the number of IDs merged away."""
+    v = db.query(conn, """SELECT v.vendor_id, v.vendor_name, COUNT(i.id) AS n FROM vendors v
+                          LEFT JOIN invoices i ON i.vendor_id = v.vendor_id
+                          WHERE v.vendor_id LIKE 'V-%' GROUP BY v.vendor_id""")
+    v = v.assign(key=v["vendor_name"].map(normalize_vendor_name)).sort_values(["n", "vendor_id"], ascending=[False, True])
+    v["keep"] = v.groupby("key")["vendor_id"].transform("first")
+    moves = v[v["vendor_id"] != v["keep"]]
+    with conn:
+        conn.executemany("UPDATE invoices SET vendor_id = ? WHERE vendor_id = ?", zip(moves["keep"], moves["vendor_id"]))
+        conn.executemany("DELETE FROM vendors WHERE vendor_id = ?", zip(moves["vendor_id"]))
+    return len(moves)

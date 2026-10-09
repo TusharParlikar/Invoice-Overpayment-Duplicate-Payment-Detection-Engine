@@ -5,6 +5,7 @@ Invoice checker web app.
 """
 import hmac
 import os
+import re
 import threading
 from datetime import date
 
@@ -19,22 +20,18 @@ IMAGE_TYPES = ["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"]
 TABLE_TYPES = ["xlsx", "xls", "csv"]
 TEMPLATE = os.path.join(config.ROOT, "templates", "company_records_template.csv")
 SHOW_VERDICT = {"SUSPICIOUS": st.error, "REVIEW": st.warning, "OK": st.success}
+DATE_ORDER = {"Detect from the file": None, "Day first (dd/mm/yyyy)": True, "Month first (mm/dd/yyyy)": False}
 
 
-@st.cache_resource
-def _model(mtime: float):  # keyed on file time so a retrain reloads it
-    return scoring.load_model()
+def md(text: str) -> str:
+    """Escape Markdown: vendor names and invoice numbers come from uploads and must not render as links or images."""
+    return re.sub(r"([!-/:-@\[-`{-~])", r"\\\1", str(text))
 
 
 @st.cache_resource
 def _preload_ocr():
     """Load the OCR engine (20-30 s) in the background at startup instead of on the first upload."""
     threading.Thread(target=receipts.load_engine, daemon=True).start()
-
-
-def anomaly_model():
-    path = config.ANOMALY_MODEL_PATH
-    return _model(os.path.getmtime(path)) if os.path.exists(path) else None
 
 
 # Optional shared password: set INVOICE_APP_PASSWORD before starting the app
@@ -59,12 +56,15 @@ n_records = db.count_invoices(conn)
 with st.sidebar:
     st.header("🧾 Invoice Checker")
     st.metric("Company records", f"{n_records:,}")
-    st.caption("Anomaly model: " + ("trained" if anomaly_model() else "not trained (rules only)"))
-    st.caption("Image-tamper model: " + ("loaded" if tamper.available() else "missing"))
+    # The password is shared, so the check log records the name each person enters here
+    user = st.text_input("Your name", key="user", help="Saved with every check you run (Recent checks)").strip() or None
+    st.caption("Image-tamper model: " + ("loaded" if tamper.available() else "missing or unreadable"))
+    if tamper.version_warning():
+        st.warning(tamper.version_warning())
 
 if n_records == 0:
     st.info("**Start here.** Open **Company records**, download the template or upload your own export of past "
-            "invoices, import it, then click **Audit records & train model**. After that you can check new invoices.")
+            "invoices, import it, then click **Audit records**. After that you can check new invoices.")
 
 tab_one, tab_batch, tab_records = st.tabs(["Check one invoice", "Check a batch", "Company records"])
 
@@ -86,6 +86,9 @@ with tab_one:
             if image is not None:
                 left.image(image, width="stretch")
             right.caption("Fields read from the document. Correct anything misread before checking.")
+            if not fields.get("invoice_id"):
+                right.warning("No invoice number found. Type it from the document: duplicates are matched on it, "
+                              "so without it a copy of a paid invoice may not be caught.")
             with right.expander("Raw text"):
                 st.text(text or "(no text found)")
 
@@ -110,15 +113,17 @@ with tab_one:
             new = pd.DataFrame([dict(invoice_id=invoice_id.strip(), vendor_name=vendor.strip(), vendor_id=vendor_id.strip() or None,
                                      invoice_date=inv_date.isoformat(), amount=amount, currency=currency)])
             with st.spinner("Checking against company records..."):
-                res, related = checks.check(conn, new, anomaly_model())
-                tamper_result = tamper.tamper_score(image) if image is not None and tamper_checkable else None
+                res, related = checks.check(conn, new)
+                tamper_skip = (tamper.cannot_assess(image) if image is not None and tamper_checkable else
+                               "not checked (only uploaded photos/scans are; PDFs lose the traces it reads)")
+                tamper_result = None if tamper_skip else tamper.tamper_score(image)
             v = checks.verdict(res.iloc[0].risk_category, bool(tamper_result and tamper_result[1]))
             checks.log_checks(conn, res, source=mode, file_name=file_key,
-                              tamper_score=tamper_result[0] if tamper_result else None, verdicts=[v])
-            st.session_state.last_check = (res, related, tamper_result, v, image)
+                              tamper_score=tamper_result[0] if tamper_result else None, verdicts=[v], checked_by=user)
+            st.session_state.last_check = (res, related, tamper_result, tamper_skip, v, image)
 
     if "last_check" in st.session_state:
-        res, related, tamper_result, v, checked_image = st.session_state.last_check
+        res, related, tamper_result, tamper_skip, v, checked_image = st.session_state.last_check
         r = res.iloc[0]
         st.divider()
         SHOW_VERDICT[v](f"**{v}**  ·  risk score {r.final_score:.2f} ({r.risk_category})")
@@ -126,7 +131,9 @@ with tab_one:
         if tamper_result and tamper_result[1]:
             reasons.append(f"The image may have been edited ({tamper_result[0]:.0%} tamper probability): "
                            "compare the outlined area with the original document")
-        st.markdown("\n".join(f"- {x}" for x in reasons))
+        if tamper_skip and "JPEG" in tamper_skip:  # say "can't assess", so it isn't read as "not edited"
+            reasons.append("Image " + tamper_skip)
+        st.markdown("\n".join(f"- {md(x)}" for x in reasons))
         if tamper_result and tamper_result[1] and tamper_result[2]:
             x, y, w, h = tamper_result[2]
             pad = 3 * w  # show the block with its surroundings
@@ -139,27 +146,29 @@ with tab_one:
             st.markdown("**Matching records**")
             st.dataframe(related.drop(columns=["new_id"]), hide_index=True)
         with st.expander("Score details"):
-            st.write(f"Rules {r.rule_score:.2f} · anomaly model {r.ml_score:.2f} · combined 60/40 into {r.final_score:.2f}. "
-                     + ("Image-tamper probability: " + (f"{tamper_result[0]:.0%}" if tamper_result else
-                        "not checked (only uploaded photos/scans are; PDFs lose the traces it reads)")))
-        if st.button("Add to company records", help="Once the invoice is approved/paid, so later copies are caught"):
-            checks.add_to_records(conn, res)
+            st.text(f"Risk score {r.final_score:.2f}: the strongest rule that fired (flags: {r.flags}). "
+                    + "Image-tamper probability: " + (f"{tamper_result[0]:.0%}" if tamper_result else tamper_skip or "not checked"))
+        if v == "SUSPICIOUS":  # adding it would make the duplicate or overpayment part of the vendor's history
+            st.caption("A suspicious invoice can't be added to company records from here. If it turns out to be fine, "
+                       "add it with an import.")
+        elif st.button("Add to company records", help="Once the invoice is approved/paid, so later copies are caught"):
+            n = checks.add_to_records(conn, res)
             del st.session_state["last_check"]
-            st.success("Saved to records.")
+            st.success("Saved to records." if n else "Already in the records.")
 
 # ── Check a batch ──────────────────────────────────────────────────────────
 with tab_batch:
     st.caption("Upload the invoices due for payment (CSV or Excel), same columns as the records template.")
     up = st.file_uploader("Invoices to check", type=TABLE_TYPES, key="batch_file")
-    dayfirst = st.checkbox("Dates are day-first (dd/mm/yyyy)", key="batch_dayfirst")
+    order = st.radio("Date order", list(DATE_ORDER), horizontal=True, key="batch_date_order")
     if up:
-        rows, problems = importer.normalize(importer.read_table(up), dayfirst=dayfirst)
+        rows, problems = importer.normalize(importer.read_table(up), dayfirst=DATE_ORDER[order])
         for p in problems:
-            st.warning(p)
+            st.warning(md(p))
         if not rows.empty and st.button(f"Check {len(rows):,} invoices", type="primary"):
             with st.spinner("Checking..."):
-                res, _ = checks.check(conn, rows, anomaly_model())
-            checks.log_checks(conn, res, source="batch", file_name=up.name)
+                res, _ = checks.check(conn, rows)
+            checks.log_checks(conn, res, source="batch", file_name=up.name, checked_by=user)
             st.session_state.batch = res
 
     if "batch" in st.session_state:
@@ -171,11 +180,12 @@ with tab_batch:
         c3.metric("OK", int(counts.get("OK", 0)))
         view = res[["verdict", "invoice_id", "vendor_name", "invoice_date", "amount", "currency", "final_score", "reasons"]]
         st.dataframe(view.sort_values("final_score", ascending=False), hide_index=True)
-        st.download_button("Download results (CSV)", view.to_csv(index=False), "check_results.csv", "text/csv")
+        st.download_button("Download results (CSV)", checks.to_csv(view), "check_results.csv", "text/csv")
         if st.button("Add all OK invoices to company records"):
-            n = checks.add_to_records(conn, res[res["verdict"] == "OK"], source="batch-check")
+            ok = res[res["verdict"] == "OK"]
+            n = checks.add_to_records(conn, ok, source="batch-check")
             del st.session_state["batch"]
-            st.success(f"Saved {n:,} invoices to records.")
+            st.success(f"Saved {n:,} invoices to records." + (f" {len(ok) - n:,} were already there." if len(ok) > n else ""))
 
 # ── Company records ────────────────────────────────────────────────────────
 with tab_records:
@@ -187,11 +197,11 @@ with tab_records:
     with open(TEMPLATE, "rb") as f:
         st.download_button("Download template (CSV)", f.read(), "company_records_template.csv", "text/csv")
     up = st.file_uploader("Company records", type=TABLE_TYPES, key="import_file")
-    dayfirst = st.checkbox("Dates are day-first (dd/mm/yyyy)", key="import_dayfirst")
+    order = st.radio("Date order", list(DATE_ORDER), horizontal=True, key="import_date_order")
     if up:
-        rows, problems = importer.normalize(importer.read_table(up), dayfirst=dayfirst)
+        rows, problems = importer.normalize(importer.read_table(up), dayfirst=DATE_ORDER[order])
         for p in problems:
-            (st.error if rows.empty else st.warning)(p)
+            (st.error if rows.empty else st.warning)(md(p))
         if not rows.empty:
             st.caption(f"{len(rows):,} rows ready. Recognized columns: {', '.join(rows.columns)}")
             st.dataframe(rows.head(20), hide_index=True)
@@ -199,16 +209,16 @@ with tab_records:
                 if n_records:
                     db.backup(conn)
                 n = importer.import_records(conn, rows, source=up.name)
-                st.success(f"Imported {n:,} records. Now run step 2.")
+                st.success(f"Imported {n:,} records. Now run step 2."
+                           + (f" Skipped {len(rows) - n:,} already in the records." if len(rows) > n else ""))
 
-    st.subheader("2. Audit records & train model")
-    st.caption("Scores every record for duplicates and overpayments already paid, and trains the anomaly model on "
-               "your history. Re-run after each import.")
-    if st.button("Audit records & train model", disabled=n_records == 0):
+    st.subheader("2. Audit records")
+    st.caption("Scores every record for duplicates and overpayments already paid. Re-run after each import.")
+    if st.button("Audit records", disabled=n_records == 0):
         with st.spinner("Auditing..."):
             s = checks.audit(conn)
         st.success(f"Audited {s['records']:,} records: {s.get('HIGH', 0):,} high risk, {s.get('MEDIUM', 0):,} medium."
-                   + ("" if s["model_trained"] else f" Anomaly model skipped: needs {config.MIN_RECORDS_FOR_MODEL}+ records."))
+                   + (f" Merged {s['vendor_ids_merged']:,} duplicate vendor IDs." if s.get("vendor_ids_merged") else ""))
 
     with st.expander("Exchange rates"):
         st.caption("USD per one unit of each currency, used to compare amounts across currencies. Rates are applied to "
@@ -229,7 +239,7 @@ with tab_records:
         WHERE d.risk_category != 'LOW' ORDER BY d.final_score DESC LIMIT 500"""), hide_index=True)
 
     st.subheader("Recent checks")
-    st.dataframe(db.query(conn, "SELECT checked_at, source, invoice_id, vendor_name, amount, verdict, final_score, "
+    st.dataframe(db.query(conn, "SELECT checked_at, checked_by, source, invoice_id, vendor_name, amount, verdict, final_score, "
                                 "tamper_score FROM receipt_checks ORDER BY id DESC LIMIT 200"), hide_index=True)
 
     with st.expander("All records (latest 1,000)"):

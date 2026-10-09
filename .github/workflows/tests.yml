@@ -9,5 +9,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - run: xargs -a packages.txt sudo apt-get install -y  # system libraries OCR needs
       - run: pip install -r requirements.txt
       - run: python tests/test_engine.py
+      - run: python tests/test_receipts.py
