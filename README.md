@@ -66,7 +66,9 @@ finds money already lost, a batch check that holds duplicates and overpayments, 
 paid, and an edited receipt with the changed area outlined.
 
 To try it yourself, [demo/](demo/) has the same mock data (all vendors are fictional): `company_records.csv` to import,
-`invoices_to_check.csv` with the expected verdict for each row, and two receipt images. Keep your real records separate
+`invoices_to_check.csv` with the expected verdict for each row, and two receipt images.
+[demo/selfTest/](demo/selfTest/) has 8 more receipts to check one by one, with the verdict each should get in `ANSWERS.csv`.
+Keep your real records separate
 by starting the app on a demo database:
 
 ```powershell
@@ -148,7 +150,8 @@ In the app:
 
 From the command line: `python cli.py check due_this_week.xlsx --out results.csv`.
 
-Every check is logged in the *Recent checks* table, with the name entered under *Your name* in the sidebar (the
+Enter your name under *Your name* in the sidebar first: the app won't run a check without it. Every check is logged in
+the *Recent checks* table with that name (the
 command line logs your system user name).
 
 ---
@@ -193,8 +196,8 @@ Measured on real data: `python tests/benchmark.py`, 10-fold cross-validation on 
   `is_anomaly` column and the audit reports precision and recall.
 - The tamper model was trained only on Malaysian retail receipts; other document types are untested. A tamper flag only asks for a
   review, and the outlined area shows the reviewer what to compare.
-- **Speed** (100,000 records, laptop CPU): checking 1 invoice takes 0.2–0.3 s, a batch of 50 under 1.5 s, and a full audit
-  11–25 s. A check slows to about 30 s if most vendor names start with the same 3 letters. OCR adds 7–15 s per photo, and the
+- **Speed** (100,000 records, laptop CPU): checking 1 invoice takes 0.2–0.4 s, a batch of 50 about 1.5 s or less, and a full audit
+  11–30 s. A check slows to about 30 s if most vendor names start with the same 3 letters. OCR adds 7–15 s per photo, and the
   tamper check a few seconds.
 - Very different spellings of one vendor still count as a new vendor unless you give its vendor ID.
 
@@ -204,7 +207,7 @@ Measured on real data: `python tests/benchmark.py`, 10-fold cross-validation on 
 |---|---|---|
 | Duplicates 97–100% caught, re-billing 98%, genuine receipts flagged 5.3%, overpayment 53% / 40% / 26% | [tests/benchmark.py](tests/benchmark.py): 10-fold test on 534 real receipts from a public dataset; full table in [HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#evaluation-honesty) | `python tests/benchmark.py` (downloads 670 MB once) |
 | Edited images 71% caught, 71% of flags right, 66% on JPEG quality 90; 3% at quality 75, 0% at half size | Held-out test set of the tamper model; tables in [HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#image-tamper-model-enginetamperpy) | `python cli.py train-tamper` |
-| Speed: 0.2–0.3 s per check, 11–25 s audit on 100,000 records | [tests/speed.py](tests/speed.py): synthetic records, 2,000 vendors | `python tests/speed.py` |
+| Speed: 0.2–0.4 s per check, 11–30 s audit on 100,000 records | [tests/speed.py](tests/speed.py): synthetic records, 2,000 vendors | `python tests/speed.py` |
 | OCR adds 7–15 s per photo | Observed while using the app; no script yet | — |
 | 0.8%–2% of payments are duplicate or erroneous | [APQC benchmark, via CFO.com](https://www.cfo.com/news/metric-of-the-month-detect-and-prevent-duplicate-or-erroneous-payments/656852/) | external |
 
@@ -240,6 +243,7 @@ engine/
 templates/          company records template
 models/tamper.joblib  shipped image-tamper model
 demo/               mock data to try the app: records to import, a batch to check, receipt images
+ruff.toml           code formatter settings (python -m ruff format .)
 tests/test_engine.py  rules, import and parser tests, run by GitHub Actions on every push
 tests/test_receipts.py  OCR + parser + tamper model on 4 committed receipts (tests/fixtures/), also run in CI
 tests/benchmark.py    accuracy on real records (10-fold)

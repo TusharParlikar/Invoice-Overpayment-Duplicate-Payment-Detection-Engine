@@ -1,9 +1,11 @@
 """
 Read an uploaded receipt (photo, scan or PDF) and pull out its invoice fields.
 
-OCR runs locally with RapidOCR (pip-only, no system Tesseract). PDFs use their text layer, falling back
-to OCR for scanned PDFs. Field parsing is heuristic: it pre-fills a form the user confirms before a check.
+OCR runs locally with RapidOCR (pip-only, no system Tesseract). PDFs use their text layer, falling
+back to OCR for scanned PDFs. Field parsing is heuristic: it pre-fills a form the user confirms
+before a check.
 """
+
 import io
 import re
 import threading
@@ -21,22 +23,28 @@ _engine_lock = threading.Lock()
 
 @cache
 def _load():
+    """Create the OCR engine (cached: one per process)."""
     from rapidocr import RapidOCR  # slow import + model load (20-30 s): once per process
+
     return RapidOCR()
 
 
 def load_engine():
-    with _engine_lock:  # the app preloads it in a background thread; an early upload waits instead of loading twice
+    """The shared OCR engine, loaded on first use."""
+    # the app preloads it in a background thread; an early upload waits instead of loading twice
+    with _engine_lock:
         return _load()
 
 
 def ocr_image(img: Image.Image) -> str:
     """OCR an image, re-assembling detected text boxes into reading-order lines."""
-    result = load_engine()(np.asarray(img.convert("RGB"))[:, :, ::-1])  # RapidOCR expects BGR like OpenCV
+    # RapidOCR expects BGR like OpenCV
+    result = load_engine()(np.asarray(img.convert("RGB"))[:, :, ::-1])
     if result.boxes is None:
         return ""
     # Boxes come per text fragment; "TOTAL" and "12.50" on one printed line are often separate.
-    # Group fragments whose vertical centres are within half a line height, then order left to right.
+    # Group fragments whose vertical centres are within half a line height, then order left to
+    # right.
     items = sorted(zip(result.boxes, result.txts), key=lambda bt: bt[0][:, 1].mean())
     lines, cur, cur_y, cur_h = [], [], 0.0, 0.0
     for box, txt in items:
@@ -60,6 +68,7 @@ def extract(file_name: str, data: bytes) -> tuple[str, Image.Image | None, bool]
     """
     if file_name.lower().endswith(".pdf"):
         import pypdfium2 as pdfium
+
         pdf = pdfium.PdfDocument(data)
         pages = [pdf[i] for i in range(len(pdf))]
         text = "\n".join(p.get_textpage().get_text_range() for p in pages)
@@ -79,37 +88,57 @@ _AMOUNT_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2})(?![\d
 _TOTAL_WORDS = re.compile(r"total|amount\s*due|balance\s*due|amount\s*payable", re.I)
 _NOT_FINAL_TOTAL = re.compile(
     r"sub\s*-?\s*total|total\s*(qty|quantity|items?|discount|savings|tax|gst|sst|vat)|"
-    r"(tax|gst|sst|vat)\s*total|total\s*excl", re.I)
+    r"(tax|gst|sst|vat)\s*total|total\s*excl",
+    re.I,
+)
 _DATE_RES = [
-    re.compile(r"\b(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})\b"),                        # 2024-03-12
-    re.compile(r"\b(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b"),                      # 12/03/2024, 12-03-24
+    re.compile(r"\b(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})\b"),  # 2024-03-12
+    re.compile(r"\b(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b"),  # 12/03/2024, 12-03-24
     re.compile(r"\b(\d{1,2}\s*[-/ ]?\s*[A-Za-z]{3,9}\.?\s*[-/ ,]?\s*\d{2,4})\b"),  # 12 Mar 2024
-    re.compile(r"\b([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})\b"),                 # March 12, 2024
+    re.compile(r"\b([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})\b"),  # March 12, 2024
 ]
-# Lookaheads, so every position is tried: a consumed non-match ("TAX INVOICE" over a line break) used to hide
-# the real "INV NO.: 1187070" after it. Label, colon and number are often on separate lines. The number starts
-# after a separator ("CS00031383" keeps its prefix); one followed by "," or "&" is an address ("NO: 1-1&2 ...").
-# The document's own number (invoice, receipt, bill) wins over order, slip and terminal numbers; a bare "NO :"
-# or a line starting with ":" (its label lines above) is the last resort.
-_ID_LABELS = [r"\b(?:tax\s+)?(?:invoice|inv|receipt|rcpt|bill|doc(?:ument)?|c/n)[ \t\-]*(?:no|num|number|#|id)?",
-              r"\b(?:ref(?:erence)?|trans(?:action)?|trn|order|cs|slip|cb|check|chk|ticket)[ \t\-]*(?:no|num|number|#|id)?"
-              r"|^[ \t]*no[ \t]*\.?(?=\s*[:#])|^[ \t]*(?=:)"]
-_INVOICE_ID_RES = [re.compile(rf"(?=(?:{labels})\s*[.:#]?\s*[:#]?\s*(?<![A-Z0-9])([A-Z0-9](?:[A-Z0-9/]|-[ \t]?){{2,}})"
-                              r"(?![A-Z0-9\-/]|[ \t]*[,&]))", re.I | re.M) for labels in _ID_LABELS]
+# Lookaheads, so every position is tried: a consumed non-match ("TAX INVOICE" over a line break)
+# used to hide the real "INV NO.: 1187070" after it. Label, colon and number are often on separate
+# lines. The number starts after a separator ("CS00031383" keeps its prefix); one followed by "," or
+# "&" is an address ("NO: 1-1&2 ..."). The document's own number (invoice, receipt, bill) wins over
+# order, slip and terminal numbers; a bare "NO :" or a line starting with ":" (its label lines
+# above) is the last resort.
+_ID_LABELS = [
+    r"\b(?:tax\s+)?(?:invoice|inv|receipt|rcpt|bill|doc(?:ument)?|c/n)[ \t\-]*(?:no|num|number|#|id)?",
+    r"\b(?:ref(?:erence)?|trans(?:action)?|trn|order|cs|slip|cb|check|chk|ticket)[ \t\-]*(?:no|num|number|#|id)?"
+    r"|^[ \t]*no[ \t]*\.?(?=\s*[:#])|^[ \t]*(?=:)",
+]
+_INVOICE_ID_RES = [
+    re.compile(
+        rf"(?=(?:{labels})\s*[.:#]?\s*[:#]?\s*(?<![A-Z0-9])([A-Z0-9](?:[A-Z0-9/]|-[ \t]?){{2,}})"
+        r"(?![A-Z0-9\-/]|[ \t]*[,&]))",
+        re.I | re.M,
+    )
+    for labels in _ID_LABELS
+]
+# addresses: "LOT 3, JALAN PELABUR 23/1,", postcodes
 _VENDOR_SKIP = re.compile(
     r"^(tax\s+invoice|invoice|receipt|official\s+receipt|cash\s+(sale|bill)|bill|welcome|thank)|"
     r"reg(istration)?\.?\s*no|\bco(mpany)?\.?\s*no|gst\s*(id|no|reg)|\btel\b|\bfax\b|tax\s*id|:|"
-    r"^(lot|no)\b\W*\d|\bjalan\b|\bjln\b|\b\d{5}\b", re.I)  # addresses: "LOT 3, JALAN PELABUR 23/1,", postcodes
+    r"^(lot|no)\b\W*\d|\bjalan\b|\bjln\b|\b\d{5}\b",
+    re.I,
+)
 _BUSINESS = re.compile(
     r"\b(sdn\.?\s*bhd|bhd|s/b|enterprise|trading|ltd|limited|llc|l\.l\.c|inc|corp(oration)?|co\.|company|gmbh|"
-    r"pvt|plt|llp|store|stores|mart|supermarket|restaurant|cafe|hardware|pharmacy|services|industries|holdings)\b", re.I)
+    r"pvt|plt|llp|store|stores|mart|supermarket|restaurant|cafe|hardware|pharmacy|services|industries|holdings)\b",
+    re.I,
+)
 _CURRENCIES = [
-    ("MYR", r"\bRM\b|\bMYR\b"), ("INR", r"₹|\bINR\b|\bRs\.?\s"), ("EUR", r"€|\bEUR\b"),
-    ("GBP", r"£|\bGBP\b"), ("USD", r"\$|\bUSD\b"),
+    ("MYR", r"\bRM\b|\bMYR\b"),
+    ("INR", r"₹|\bINR\b|\bRs\.?\s"),
+    ("EUR", r"€|\bEUR\b"),
+    ("GBP", r"£|\bGBP\b"),
+    ("USD", r"\$|\bUSD\b"),
 ]
 
 
 def _amounts(s: str) -> list[float]:
+    """All money amounts found in a line of text."""
     return [float(a.replace(",", "")) for a in _AMOUNT_RE.findall(s)]
 
 
@@ -129,31 +158,43 @@ def parse_date(text: str, dayfirst: bool = True) -> str | None:
     """First date-looking string in the text, as ISO yyyy-mm-dd."""
     for rx in _DATE_RES:
         for m in rx.finditer(text):
-            d = pd.to_datetime(m.group(1), dayfirst=dayfirst and not rx.pattern.startswith(r"\b(\d{4}"),
-                               errors="coerce")
+            d = pd.to_datetime(
+                m.group(1),
+                dayfirst=dayfirst and not rx.pattern.startswith(r"\b(\d{4}"),
+                errors="coerce",
+            )
             if pd.notna(d) and 1990 <= d.year <= 2100:
                 return d.date().isoformat()
     return None
 
 
 def parse_invoice_id(text: str) -> str | None:
+    """The document's own number, from labelled patterns; dates are rejected."""
     for id_re in _INVOICE_ID_RES:
         for m in id_re.finditer(text):
-            candidate = re.sub(r"\s", "", m.group(1)).strip("-/")  # "V001- 515592": a space read after a dash
-            if any(c.isdigit() for c in candidate) and not any(rx.fullmatch(candidate) for rx in _DATE_RES):
+            # "V001- 515592": a space read after a dash
+            candidate = re.sub(r"\s", "", m.group(1)).strip("-/")
+            if any(c.isdigit() for c in candidate) and not any(
+                rx.fullmatch(candidate) for rx in _DATE_RES
+            ):
                 return candidate
     return None
 
 
 def parse_vendor(lines: list[str]) -> str | None:
     """Receipts put the seller's name at the top. Prefer a top line that looks like a business name
-    (handwritten notes or a cashier's name can sit above it); else the first line with real words."""
-    top = [ln.strip() for ln in lines[:8]  # bracketed registration numbers don't make a line a field or address
-           if sum(c.isalpha() for c in ln) >= 3 and not _VENDOR_SKIP.search(re.sub(r"\(.*?\)", "", ln))]
+    (handwritten notes or a cashier's name can sit above it); else the first line with real words.
+    """
+    top = [
+        ln.strip()
+        for ln in lines[:8]  # bracketed registration numbers don't make a line a field or address
+        if sum(c.isalpha() for c in ln) >= 3 and not _VENDOR_SKIP.search(re.sub(r"\(.*?\)", "", ln))
+    ]
     return next((ln for ln in top if _BUSINESS.search(ln)), top[0] if top else None)
 
 
 def parse_currency(text: str) -> str | None:
+    """The currency code, from a symbol or code in the text."""
     for code, rx in _CURRENCIES:
         if re.search(rx, text, re.I):
             return code
@@ -161,6 +202,7 @@ def parse_currency(text: str) -> str | None:
 
 
 def parse_fields(text: str, dayfirst: bool = True) -> dict:
+    """Vendor, invoice number, date, total and currency read from OCR text."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return {
         "vendor_name": parse_vendor(lines),

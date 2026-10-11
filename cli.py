@@ -8,6 +8,7 @@ Command line for the invoice checker. Everything here is also available in the w
     python cli.py demo                                load ~530 real receipts as sample records (downloads 670 MB once)
     python cli.py train-tamper                        retrain the image-tamper model (downloads 670 MB once)
 """
+
 import argparse
 import getpass
 import os
@@ -16,6 +17,7 @@ from engine import checks, db, importer, tamper
 
 
 def _load(path: str, dayfirst: bool):
+    """Read a CSV/Excel file into normalized rows, printing any rows that were skipped."""
     rows, problems = importer.normalize(importer.read_table(path), dayfirst=dayfirst)
     for p in problems:
         print("  !", p)
@@ -23,15 +25,32 @@ def _load(path: str, dayfirst: bool):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    """Parse the command line and run the chosen command."""
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = ap.add_subparsers(dest="command", required=True)
     for name in ("import", "check"):
         p = sub.add_parser(name)
         p.add_argument("file", help="CSV or Excel file")
         order = p.add_mutually_exclusive_group()  # default: detected from the file
-        order.add_argument("--dayfirst", action="store_const", const=True, dest="dayfirst", help="dates are dd/mm/yyyy")
-        order.add_argument("--monthfirst", action="store_const", const=False, dest="dayfirst", help="dates are mm/dd/yyyy")
-    sub.choices["check"].add_argument("--out", default="check_results.csv", help="where to write results")
+        order.add_argument(
+            "--dayfirst",
+            action="store_const",
+            const=True,
+            dest="dayfirst",
+            help="dates are dd/mm/yyyy",
+        )
+        order.add_argument(
+            "--monthfirst",
+            action="store_const",
+            const=False,
+            dest="dayfirst",
+            help="dates are mm/dd/yyyy",
+        )
+    sub.choices["check"].add_argument(
+        "--out", default="check_results.csv", help="where to write results"
+    )
     sub.add_parser("audit")
     sub.add_parser("backup")
     sub.add_parser("demo")
@@ -47,8 +66,10 @@ def main():
     if args.command == "import":
         rows = _load(args.file, args.dayfirst)
         n = importer.import_records(conn, rows, source=os.path.basename(args.file))
-        print(f"Imported {n:,} invoices ({db.count_invoices(conn):,} records in total). Next: python cli.py audit"
-              + (f"\n  Skipped {len(rows) - n:,} already in the records." if len(rows) > n else ""))
+        print(
+            f"Imported {n:,} invoices ({db.count_invoices(conn):,} records in total). Next: python cli.py audit"
+            + (f"\n  Skipped {len(rows) - n:,} already in the records." if len(rows) > n else "")
+        )
     elif args.command == "demo":
         n = importer.import_records(conn, tamper.demo_history(), source="demo")
         print(f"Imported {n:,} demo receipts. Next: python cli.py audit")
@@ -62,7 +83,13 @@ def main():
             print(f"  {k:<26} {v}")
     elif args.command == "check":
         res, _ = checks.check(conn, _load(args.file, args.dayfirst))
-        checks.log_checks(conn, res, source="cli", file_name=os.path.basename(args.file), checked_by=getpass.getuser())
+        checks.log_checks(
+            conn,
+            res,
+            source="cli",
+            file_name=os.path.basename(args.file),
+            checked_by=getpass.getuser(),
+        )
         with open(args.out, "w", encoding="utf-8", newline="") as f:
             f.write(checks.to_csv(res.drop(columns=["id"])))
         print(res["verdict"].value_counts().to_string(), f"\nWrote {args.out}")

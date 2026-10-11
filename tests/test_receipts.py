@@ -1,9 +1,11 @@
 """
-OCR, field parser and image-tamper model on real receipts, checked against tests/fixtures/expected.csv.
-A change to OCR, the parser or the model that breaks any of these fails CI.
+OCR, field parser and image-tamper model on real receipts, checked against
+tests/fixtures/expected.csv. A change to OCR, the parser or the model that breaks any of these fails
+CI.
 
 Run: python tests/test_receipts.py   (or pytest; the first run downloads the OCR models, about 30 MB)
 """
+
 import io
 import os
 import sys
@@ -19,6 +21,7 @@ EXPECTED = pd.read_csv(os.path.join(FIXTURES, "expected.csv"), dtype={"invoice_i
 
 
 def _open(name: str) -> tuple[str, Image.Image]:
+    """OCR text and image of a fixture receipt."""
     with open(os.path.join(FIXTURES, name), "rb") as f:
         text, img, checkable = receipts.extract(name, f.read())
     assert checkable
@@ -26,6 +29,7 @@ def _open(name: str) -> tuple[str, Image.Image]:
 
 
 def test_fields_read_from_photos():
+    """OCR and the parser read the expected fields from each fixture receipt."""
     for r in EXPECTED.itertuples():
         f = receipts.parse_fields(_open(r.file)[0])
         got = (f["vendor_name"], f["invoice_id"], f["invoice_date"], f["amount"])
@@ -33,6 +37,7 @@ def test_fields_read_from_photos():
 
 
 def test_tamper_verdicts():
+    """The tamper model flags the forged fixtures and not the genuine ones."""
     assert tamper.available(), "models/tamper.joblib is missing or can't be loaded"
     for r in EXPECTED.itertuples():
         score, flagged, _ = tamper.tamper_score(_open(r.file)[1])
@@ -40,6 +45,7 @@ def test_tamper_verdicts():
 
 
 def test_low_quality_jpeg_is_not_assessed():
+    """A quality-75 JPEG is reported as not assessable; quality 92 is assessed."""
     img = _open(EXPECTED["file"].iloc[0])[1].convert("RGB")
     for quality, assessable in ((75, False), (92, True)):
         buf = io.BytesIO()

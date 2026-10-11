@@ -1,0 +1,5 @@
+line-length = 100
+
+[format]
+# config.py is a table of constants with aligned comments
+exclude = ["engine/config.py"]

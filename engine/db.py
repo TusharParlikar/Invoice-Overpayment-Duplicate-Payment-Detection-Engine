@@ -1,4 +1,5 @@
 """SQLite storage: company invoice records, the last audit's results, and a log of every check."""
+
 import os
 import sqlite3
 from datetime import datetime
@@ -87,20 +88,24 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA cache_size=-65536")  # 64 MB: the 2 MB default thrashes on 100K-row imports
     conn.executescript(SCHEMA)
-    if "checked_by" not in {r[1] for r in conn.execute("PRAGMA table_info(receipt_checks)")}:  # older databases
+    # older databases
+    if "checked_by" not in {r[1] for r in conn.execute("PRAGMA table_info(receipt_checks)")}:
         conn.execute("ALTER TABLE receipt_checks ADD COLUMN checked_by TEXT")
     return conn
 
 
 def query(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.DataFrame:
+    """Run a SELECT and return the result as a DataFrame."""
     return pd.read_sql_query(sql, conn, params=params)
 
 
 def count_invoices(conn: sqlite3.Connection) -> int:
+    """Number of invoices in the company records."""
     return conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0]
 
 
 def append(conn: sqlite3.Connection, table: str, df: pd.DataFrame):
+    """Append rows to a table in one transaction."""
     with conn:
         df.to_sql(table, conn, if_exists="append", index=False, chunksize=500)
 
@@ -109,8 +114,10 @@ def add_vendors(conn: sqlite3.Connection, vendors: pd.DataFrame):
     """Insert vendors, skipping vendor_ids that already exist."""
     cols = list(vendors.columns)
     with conn:
-        conn.executemany(f"INSERT OR IGNORE INTO vendors ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-                         vendors.itertuples(index=False, name=None))
+        conn.executemany(
+            f"INSERT OR IGNORE INTO vendors ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+            vendors.itertuples(index=False, name=None),
+        )
 
 
 def backup(conn: sqlite3.Connection, folder: str = config.BACKUP_DIR, keep: int = 30) -> str:
@@ -126,6 +133,7 @@ def backup(conn: sqlite3.Connection, folder: str = config.BACKUP_DIR, keep: int 
 
 
 def replace_results(conn: sqlite3.Connection, results: pd.DataFrame):
+    """Replace the stored audit results with those of the latest audit."""
     with conn:
         conn.execute("DELETE FROM detection_results")
         results.to_sql("detection_results", conn, if_exists="append", index=False, chunksize=500)
