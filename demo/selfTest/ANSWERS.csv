@@ -1,0 +1,9 @@
+file,expected,why
+receipt_01.png,OK,"A new invoice that has not been paid, for a normal amount"
+receipt_02.png,SUSPICIOUS,Overpayment: about 6x what this vendor usually charges
+receipt_03.png,SUSPICIOUS,Exact copy of an invoice already paid
+receipt_04.png,REVIEW,"Possible overpayment: about 2.2x the usual, worth a second look"
+receipt_05.png,OK,"A vendor with no history: nothing to compare with, and the reason says so"
+receipt_06.png,SUSPICIOUS,A paid invoice with its number written without dashes
+receipt_07.png,REVIEW,A paid invoice number billed again with 18% added
+receipt_08.png,SUSPICIOUS,"A paid invoice re-sent with a new date: same vendor, number and amount"

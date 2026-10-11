@@ -239,7 +239,7 @@ engine/
   db.py             SQLite schema and helpers
 templates/          company records template
 models/tamper.joblib  shipped image-tamper model
-demo/               mock data, and the scripts that make it and record the demo video (make_demo_data.py, record_demo_video.py)
+demo/               mock data to try the app: records to import, a batch to check, receipt images
 tests/test_engine.py  rules, import and parser tests, run by GitHub Actions on every push
 tests/test_receipts.py  OCR + parser + tamper model on 4 committed receipts (tests/fixtures/), also run in CI
 tests/benchmark.py    accuracy on real records (10-fold)
