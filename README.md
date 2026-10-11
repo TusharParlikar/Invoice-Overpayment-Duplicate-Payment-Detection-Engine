@@ -43,6 +43,22 @@ at it again, or hold it, catching the inexact duplicates, unusual amounts and ed
 - **Small teams have no tool for it.** Duplicate-detection modules and recovery audits are built for large ERPs. This runs on
   one laptop from a CSV export, keeps the data in-house, and explains every verdict in plain words.
 
+## Existing tools and how this compares
+
+| Tool | What it does | What it misses | What this engine does |
+|---|---|---|---|
+| **SAP** duplicate invoice check | Blocks or warns when company code, vendor, reference (invoice number), invoice date and currency match an earlier invoice; amount depends on release and configuration ([SAP KBA 3774533](https://userapps.support.sap.com/sap/support/knowledge/en/3774533)) | A reference typed differently, or the date changed | Matches numbers ignoring dashes and spaces, tolerates OCR slips, and allows dates up to 7 days apart |
+| **Oracle Payables** | Standard check on supplier + invoice number; optional extra check on supplier, type, amount, currency and date ([Oracle docs](https://docs.oracle.com/en/cloud/saas/financials/25d/fappp/how-can-i-find-duplicate-invoices-without-considering-the.html)) | The same bill under a slightly different supplier name or number ([Oracle docs](https://docs.oracle.com/cd/A60725_05/html/comnls/us/ap/duplinv.htm)) | Fuzzy vendor-name matching ("Acme Corp" = "ACME CORPORATION LLC") together with fuzzy number matching |
+| **QuickBooks Online** | Optional warning when a bill number repeats for the same vendor ([community answer](https://quickbooks.intuit.com/community/reports-and-accounting-5/how-can-i-avoid-accidentally-paying-invoices-twice-56358)) | Other number formats, the same vendor entered twice, unusual amounts | Catches format variants and flags amounts far above the vendor's normal range |
+| **Xero** | Warns when contact, reference and amount match; you can still save ([Xero product ideas](https://productideas.xero.com/forums/967139-purchase-orders-bills-inventory/suggestions/45612199-block-users-from-posting-duplicate-bills)) | `INV-1234` vs `1234`; users report no warning on CSV imports | Same checks for typed entries, photos and Excel batches; holds the invoice as SUSPICIOUS |
+| **APEX Analytix** ([product page](https://apexanalytix.com/overpayment-prevention-module)) | Machine-learning near-duplicate matching, ERP integration, automatic payment blocking | Enterprise contract, priced on request, no published accuracy | Free and open source; accuracy published and reproducible (`python tests/benchmark.py`); **does not** block payments automatically |
+| **AppZen** ([blog](https://www.appzen.com/blog/5-ways-to-stop-accounts-payable-leakage-with-ai)) | AI audit of invoices, expenses and card spend, including duplicates across systems | Enterprise contract, priced on request, data goes to their platform | Runs on your machine, data stays in-house; also flags edited receipt images and outlines the changed area |
+
+**Measured:** 97–100% of duplicate variants caught, 5.3% of genuine receipts flagged
+([where the numbers come from](#where-the-numbers-come-from)). **Limits:** no automatic payment blocking, one machine with
+one shared password ([docs/STORE.md](docs/STORE.md)), and tested only on 534 retail receipts. QuickBooks and Xero details come
+from community posts; APEX Analytix and AppZen capabilities are those companies' own claims.
+
 ## Demo
 
 ▶️ **[Watch the demo video](https://drive.google.com/file/d/1J0F_hpMlzdyAN1gmBoHU7uYEiX8FU7Yz/view?usp=drive_link)** (3¾ minutes, narrated, on Google Drive): importing a year of invoices, an audit that
